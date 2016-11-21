@@ -42,10 +42,11 @@ void* find(node *head, const char *key) {
 }
 
 void append(node *head, const char *key, void *value) {
-  while (head && strcmp(head->key, key))
+  bool found;
+  while (head->next && (found = strcmp(head->key, key)))
     head = head->next;
 
-  if (head)
+  if (!found)
     head->next = new_node(key, value, NULL, head);
 }
 
