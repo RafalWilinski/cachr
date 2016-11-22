@@ -69,7 +69,13 @@ void resize(dict *d, int64_t capacity) {
   node* new_data = malloc(capacity * sizeof(node));
   node* old_data = d->data;
 
-  // WRITEME
+  int64_t i;
+  for(i=0; i<d->capacity; i++) {
+    node *head = (d->data + i)->next;
+    while(head) {
+      
+    }
+  }
 
   d->capacity = capacity;
   d->data = new_data;
