@@ -1,12 +1,17 @@
-cmake_minimum_required(VERSION 3.5  )
-project(caching_proxy)
+cmake_minimum_required(VERSION 3.5)
+project(cachr)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -O3")
+set (Tutorial_VERSION_MAJOR 0)
+set (Tutorial_VERSION_MINOR 1)
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
 
 set(SOURCE_FILES
         src/dict.c
         src/dict.h
-        src/main.c
+        src/ini.c
+        src/ini.h
+        main.c
         )
 
-add_executable(caching_proxy ${SOURCE_FILES})
+add_executable(cachr ${SOURCE_FILES})
