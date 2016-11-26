@@ -1,4 +1,4 @@
-### Cachr
+### Cachr [![Build Status](https://travis-ci.org/RafalWilinski/cachr.svg?branch=master)](https://travis-ci.org/RafalWilinski/cachr)
 
 Simple HTTP Caching proxy implementation in pure C.
 

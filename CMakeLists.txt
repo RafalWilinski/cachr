@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.5)
 project(cachr)
 
-set (Tutorial_VERSION_MAJOR 0)
-set (Tutorial_VERSION_MINOR 1)
+set (VERSION_MAJOR 0)
+set (VERSION_MINOR 1)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
 

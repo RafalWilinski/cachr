@@ -6,3 +6,5 @@ CMakeFiles/
 Makefile
 cachr
 cmake_install.cmake
+
+*.cbp
