@@ -1,7 +1,7 @@
 #include <string.h>
 #include "dict.h"
 
-node* new_node(const char* key, void* value, node *next, node *prev) {
+node* dict_new_node(const char* key, void* value, node *next, node *prev) {
   node *n = malloc(sizeof(node));
   n->key   = key;
   n->value = value;
@@ -11,7 +11,7 @@ node* new_node(const char* key, void* value, node *next, node *prev) {
   return n;
 }
 
-dict* new_dict() {
+dict* dict_new() {
   dict *d = malloc(sizeof(dict));
   d->size      = 0;
   d->capacity  = 16;
@@ -20,7 +20,7 @@ dict* new_dict() {
   return d;
 }
 
-uint64_t hash(const char *key) {
+uint64_t dict_hash(const char *key) {
   int32_t v = 37;
   uint64_t h;
   unsigned const char *ukey;
@@ -34,23 +34,23 @@ uint64_t hash(const char *key) {
   return h;
 }
 
-void* find(node *head, const char *key) {
+void* dict_find(node *head, const char *key) {
   while (head && strcmp(head->key, key))
     head = head->next;
 
   return head ? head->value : NULL;
 }
 
-void append(node *head, const char *key, void *value) {
+void dict_append(node *head, const char *key, void *value) {
   bool found;
   while (head->next && (found = strcmp(head->key, key)))
     head = head->next;
 
   if (!found)
-    head->next = new_node(key, value, NULL, head);
+    head->next = dict_new_node(key, value, NULL, head);
 }
 
-void* remove_node(node *head, const char *key) {
+void* dict_remove_node(node *head, const char *key) {
   while (head && strcmp(head->key, key))
     head = head->next;
 
@@ -65,7 +65,7 @@ void* remove_node(node *head, const char *key) {
   return head ? head->value : NULL;
 }
 
-void resize(dict *d, int64_t capacity) {
+void dict_resize(dict *d, int64_t capacity) {
   node* new_data = malloc(capacity * sizeof(node));
   node* old_data = d->data;
 
@@ -82,20 +82,20 @@ void resize(dict *d, int64_t capacity) {
   free(old_data);
 }
 
-void add(dict *d, const char *key, void* value) {
-  uint64_t idx = hash(key) % d->capacity;
-  append(d->data + idx, key, value);
+void dict_add(dict *d, const char *key, void* value) {
+  uint64_t idx = dict_hash(key) % d->capacity;
+  dict_append(d->data + idx, key, value);
 
   if (d->size)
-    resize(d, d->capacity * 2);
+    dict_resize(d, d->capacity * 2);
 }
 
-void* get(dict *d, const char *key) {
-  uint64_t idx = hash(key) % d->capacity;
-  return find(d->data+idx, key);
+void* dict_get(dict *d, const char *key) {
+  uint64_t idx = dict_hash(key) % d->capacity;
+  return dict_find(d->data+idx, key);
 }
 
-void* remove(dict *d, const char *key) {
-  uint64_t idx = hash(key) % d->capacity;
-  return remove_node(d->data+idx, key);
+void* dict_remove(dict *d, const char *key) {
+  uint64_t idx = dict_hash(key) % d->capacity;
+  return dict_remove_node(d->data+idx, key);
 }

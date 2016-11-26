@@ -1,5 +1,5 @@
-#ifndef DICTIONARY_HEADER
-#define DICTIONARY_HEADER
+#ifndef __DICTIONARY_H__
+#define __DICTIONARY_H__
 
 #include <stdlib.h>
 #include <stdbool.h>
@@ -21,23 +21,23 @@ typedef struct {
   node* entries;
 } dict;
 
-node* new_node(const char* key, void* value, node *next, node *prev);
+node* dict_new_node(const char* key, void* value, node *next, node *prev);
 
-dict* new_dict();
+dict* dict_new();
 
-uint64_t hash(const char *key);
+uint64_t dict_hash(const char *key);
 
-void* find(node *head, const char *key);
+void* dict_find(node *head, const char *key);
 
-void append(node *head, const char *key, void *value);
+void dict_append(node *head, const char *key, void *value);
 
-void* remove_node(node *head, const char *key);
+void* dict_remove_node(node *head, const char *key);
 
-void resize(dict *d, int64_t capacity);
+void dict_resize(dict *d, int64_t capacity);
 
-void add(dict *d, const char *key, void* value);
+void dict_add(dict *d, const char *key, void* value);
 
-void* get(dict *d, const char *key);
+void* dict_get(dict *d, const char *key);
 
-void* remove(dict *d, const char *key);
+void* dict_remove(dict *d, const char *key);
 #endif
