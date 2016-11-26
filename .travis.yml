@@ -2,4 +2,5 @@ language: c
 compiler:
   - clang
   - gcc
+install: cmake .
 script: make && make test
