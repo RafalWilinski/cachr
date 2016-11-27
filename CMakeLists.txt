@@ -11,6 +11,8 @@ set(SOURCE_FILES
         src/dict.h
         src/ini.c
         src/ini.h
+        src/error.c
+        src/error.h
         main.c
         )
 
