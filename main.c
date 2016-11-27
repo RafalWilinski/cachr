@@ -104,6 +104,7 @@ int prepare_in_sock(configuration cfg) {
       }
 
       freeaddrinfo(result);
+      return sfd;
     }
     close(sfd);
   }
@@ -146,6 +147,8 @@ void run(int listen_sck_fd, configuration cfg) {
             write(fds[c].fd, buffer, (size_t) bufsize);
             c++;
           }
+
+          close(fds[i].fd);
         }
       }
     }
