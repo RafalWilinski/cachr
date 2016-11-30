@@ -28,6 +28,14 @@ typedef struct {
   unsigned short fds_count;
 } configuration;
 
+typedef struct {
+  const char* host;
+  const char* type;
+  const char* content_length;
+  const char* etag;
+  const char* data;
+} http_request;
+
 static int config_handler(void *user, const char *section, const char *name, const char *value) {
   configuration *pconfig = (configuration *) user;
 
@@ -89,6 +97,8 @@ int prepare_in_sock(configuration cfg) {
     if (sfd == -1)
       continue;
 
+    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int));
+
     s = bind(sfd, rp->ai_addr, rp->ai_addrlen);
     if (s == 0) {
       s = make_socket_non_blocking(sfd);
@@ -112,6 +122,15 @@ int prepare_in_sock(configuration cfg) {
   return -1;
 }
 
+char* parse_response(char* response) {
+  char *token = NULL;
+  token = strtok(response, "\n");
+  while (token) {
+    printf("Current token: %s.\n", token);
+    token = strtok(NULL, "\n");
+  }
+}
+
 void run(int listen_sck_fd, configuration cfg) {
   socklen_t clilen;
   struct pollfd *fds = (struct pollfd *) calloc(cfg.fds_count, sizeof(struct pollfd));
@@ -124,29 +143,23 @@ void run(int listen_sck_fd, configuration cfg) {
     for (int i = 0; i < sck_cnt; i++) {
       if (i == 0) {
         fds[i].revents = 0;
+
         int newsockfd = accept(listen_sck_fd, (struct sockaddr *) &cli_addr, &clilen);
-        if (newsockfd < 0) {
-          handle_error(1, errno, "accept");
+        if (newsockfd > 0) {
+          fds[sck_cnt].fd = newsockfd;
+          fds[sck_cnt].events = POLLIN;
+          sck_cnt++;
+
+          printf("New connection on file descriptor #%d, i: %d\n", newsockfd, sck_cnt);
         }
-
-        fds[sck_cnt].fd = newsockfd;
-        fds[sck_cnt].events = POLLIN;
-        sck_cnt++;
-
-        printf("New connection on file descriptor #%d\n", newsockfd);
       } else {
-        int c = 0;
         ssize_t bufsize = read(fds[i].fd, buffer, BUFSIZE);
 
         if (bufsize > 0) {
           fds[i].revents = 0;
 
-          printf("New request: %s from #%d [fd: %d]", buffer, i, fds[i].fd);
-
-          while (fds[c].fd != 0) {
-            write(fds[c].fd, buffer, (size_t) bufsize);
-            c++;
-          }
+          printf("New request: %s\n from #%d [fd: %d]", buffer, i, fds[i].fd);
+          parse_response(buffer);
 
           close(fds[i].fd);
         }
