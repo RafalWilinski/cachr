@@ -9,6 +9,7 @@
 #include "src/dict.h"
 #include "src/ini.h"
 #include "src/error.h"
+#include "src/stack.h"
 
 #define BUFSIZE 1024
 char buffer[BUFSIZE];
@@ -26,6 +27,7 @@ typedef struct {
   const char *listen_port;
 
   unsigned short fds_count;
+  unsigned short non_blocking;
 } configuration;
 
 typedef struct {
@@ -50,6 +52,8 @@ static int config_handler(void *user, const char *section, const char *name, con
     pconfig->listen_host = strdup(value);
   } else if (MATCH("poll", "fds_count")) {
     pconfig->fds_count = (unsigned short) atoi(value);
+  } else if (MATCH("socket", "non_blocking")) {
+    pconfig->non_blocking = (unsigned short) atoi(value);
   } else {
     return 0;
   }
@@ -97,14 +101,16 @@ int prepare_in_sock(configuration cfg) {
     if (sfd == -1)
       continue;
 
-    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int));
+    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR | SO_RCVTIMEO, &(int){ 1 }, sizeof(int));
 
     s = bind(sfd, rp->ai_addr, rp->ai_addrlen);
     if (s == 0) {
-      s = make_socket_non_blocking(sfd);
-      if (s == -1) {
-        perror("non-blocking");
-        abort();
+      if (cfg.non_blocking > 0) {
+        s = make_socket_non_blocking(sfd);
+        if (s == -1) {
+          perror("non-blocking");
+          abort();
+        }
       }
 
       s = listen(sfd, SOMAXCONN);
@@ -132,36 +138,70 @@ char* parse_response(char* response) {
 }
 
 void run(int listen_sck_fd, configuration cfg) {
+  int upperBound = 1;
   socklen_t clilen;
+  stackT freeIndexesStack;
   struct pollfd *fds = (struct pollfd *) calloc(cfg.fds_count, sizeof(struct pollfd));
+  StackInit(&freeIndexesStack, cfg.fds_count);
+
   fds[0].fd = listen_sck_fd;
   fds[0].events = POLLIN;
 
-  printf("Server started...\n");
+  int i = 0;
+  for (i = cfg.fds_count - 1; i > 0; i--) {
+    StackPush(&freeIndexesStack, (stackElementT) (i));
+  }
+
+  printf("Server started. Maximum concurrent connections: %d\n", cfg.fds_count);
 
   while (poll(fds, (nfds_t) sck_cnt, -1)) {
-    for (int i = 0; i < sck_cnt; i++) {
+    printf("Poll!\n");
+
+    for (i = 0; i < upperBound; i++) {
       if (i == 0) {
         fds[i].revents = 0;
 
         int newsockfd = accept(listen_sck_fd, (struct sockaddr *) &cli_addr, &clilen);
         if (newsockfd > 0) {
-          fds[sck_cnt].fd = newsockfd;
-          fds[sck_cnt].events = POLLIN;
-          sck_cnt++;
+          if (!StackIsEmpty(&freeIndexesStack)) {
+            int idx = StackPop(&freeIndexesStack);
 
-          printf("New connection on file descriptor #%d, i: %d\n", newsockfd, sck_cnt);
+            fds[idx].fd = newsockfd;
+            fds[idx].events = POLLIN;
+
+            if (idx >= upperBound) {
+              upperBound = idx + 1;
+
+              printf("New upper bound: %d\n", upperBound);
+            }
+
+            printf("New connection on file descriptor #%d, idx: %d\n", fds[idx].fd, idx);
+          } else {
+            printf("Stack empty!");
+          }
+        } else {
+          printf("Negative newsockfd! %d\n", newsockfd);
         }
       } else {
         ssize_t bufsize = read(fds[i].fd, buffer, BUFSIZE);
 
+        if (bufsize < 0) {
+          printf("%d %s\n", errno, strerror(errno));
+          handle_error(1, errno, "read");
+        }
+
         if (bufsize > 0) {
           fds[i].revents = 0;
 
-          printf("New request: %s\n from #%d [fd: %d]", buffer, i, fds[i].fd);
+          printf("New request: %s\nFrom #%d [fd: %d]\n", buffer, i, fds[i].fd);
           parse_response(buffer);
 
           close(fds[i].fd);
+          StackPush(&freeIndexesStack, (stackElementT) i);
+
+          printf("Connection closed. Fd: %d, idx: %d\n", fds[i].fd, i);
+        } else {
+          printf("Nothing to read on fds #%d, idx: %d\n, bufsize: %d", fds[i].fd, i, bufsize);
         }
       }
     }

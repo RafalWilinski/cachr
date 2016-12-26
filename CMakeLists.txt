@@ -14,6 +14,6 @@ set(SOURCE_FILES
         src/error.c
         src/error.h
         main.c
-        src/buffer.c src/stack.c src/stack.h)
+        src/stack.c src/stack.h)
 
 add_executable(cachr ${SOURCE_FILES})
