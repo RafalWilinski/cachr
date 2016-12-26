@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/fcntl.h>
+#include <arpa/inet.h>
 
 #include "src/dict.h"
 #include "src/ini.h"
@@ -30,6 +31,8 @@ typedef struct {
   unsigned short non_blocking;
 } configuration;
 
+configuration cfg;
+
 typedef struct {
   const char* host;
   const char* type;
@@ -37,6 +40,11 @@ typedef struct {
   const char* etag;
   const char* data;
 } http_request;
+
+typedef struct {
+  const char* data;
+  short status;
+} target_request;
 
 static int config_handler(void *user, const char *section, const char *name, const char *value) {
   configuration *pconfig = (configuration *) user;
@@ -101,7 +109,7 @@ int prepare_in_sock(configuration cfg) {
     if (sfd == -1)
       continue;
 
-    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR | SO_RCVTIMEO, &(int){ 1 }, sizeof(int));
+    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int));
 
     s = bind(sfd, rp->ai_addr, rp->ai_addrlen);
     if (s == 0) {
@@ -136,6 +144,64 @@ char* parse_response(char* response) {
     token = strtok(NULL, "\n");
   }
 }
+
+target_request* tcp_request(char* request_data) {
+  struct sockaddr_in sck_addr;
+  pid_t pid;
+  int status = 0, sck;
+  ssize_t bytes_read;
+  char buffer[1024];
+
+  // Run on separate thread
+  if ((pid = fork ()) == 0) {
+    memset (&sck_addr, 0, sizeof sck_addr);
+    sck_addr.sin_family = AF_INET;
+    inet_aton (cfg.target_host, &sck_addr.sin_addr);
+    sck_addr.sin_port = htons (cfg.target_port);
+
+    if ((sck = socket (PF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
+      handle_error(sck, errno, "Could not create socket for target request");
+      exit(EXIT_FAILURE);
+    }
+
+    if (connect (sck, (struct sockaddr*) &sck_addr, sizeof sck_addr) < 0) {
+      handle_error(EHOSTUNREACH, EHOSTUNREACH, "Could not connect to host");
+      exit(EXIT_FAILURE);
+    }
+
+    printf("Requesting %s:%d...\n", cfg.target_host, cfg.target_port);
+
+    // Send request data
+    // ssize_t write_status = write(sck, request_data, sizeof(request_data));
+    // printf("written: %d", (int) write_status);
+
+    // Receive response from server
+    while ((bytes_read = read (sck,  buffer, 1024)) > 0)
+      write (1, buffer, (size_t) bytes_read);
+
+    printf("Data from target received: %s\n", buffer);
+    close (sck);
+    exit(EXIT_SUCCESS);
+  }
+
+  waitpid(pid, &status, WCONTINUED);
+
+  target_request *resp = malloc(sizeof(target_request));
+
+  if(WIFEXITED(status)) {
+    if(WEXITSTATUS(status) == 0) {
+      memcpy(buffer, resp->data, sizeof(buffer));
+      resp->status = 1;
+    } else {
+      resp->status = -1;
+    }
+  } else {
+    resp->status = -1;
+  }
+
+  return resp;
+}
+
 
 void run(int listen_sck_fd, configuration cfg) {
   int upperBound = 1;
@@ -196,12 +262,20 @@ void run(int listen_sck_fd, configuration cfg) {
           printf("New request: %s\nFrom #%d [fd: %d]\n", buffer, i, fds[i].fd);
           parse_response(buffer);
 
+          // Find in cache
+          // If not found request & respond
+          // Else respond with content from cache
+          // Close socket
+
+          target_request *payload = tcp_request(buffer);
+          printf("Status: %d, Payload: %s", payload->status, payload->data);
+
           close(fds[i].fd);
           StackPush(&freeIndexesStack, (stackElementT) i);
 
           printf("Connection closed. Fd: %d, idx: %d\n", fds[i].fd, i);
         } else {
-          printf("Nothing to read on fds #%d, idx: %d\n, bufsize: %d", fds[i].fd, i, bufsize);
+          printf("Nothing to read on fds #%d, idx: %d\n, bufsize: %d", fds[i].fd, i, (int) bufsize);
         }
       }
     }
@@ -209,7 +283,6 @@ void run(int listen_sck_fd, configuration cfg) {
 }
 
 int main(int argc, char **argv) {
-  configuration cfg;
   char *config_name;
 
   if (argc >= 2) {
@@ -219,7 +292,7 @@ int main(int argc, char **argv) {
   }
 
   if (ini_parse(config_name, config_handler, &cfg) < 0) {
-    printf("Can't load '%s'\n", config_name);
+    handle_error(1, EACCES, "Can't load config");
     return 1;
   }
 
@@ -232,6 +305,5 @@ int main(int argc, char **argv) {
   }
 
   run(listen_sck, cfg);
-
   return 0;
 }
