@@ -13,12 +13,15 @@ make
 2. Run with `./cachr` command. You can optionally supply own config by passing it as argument to executable. E.g. `./cachr new_config.ini`
 
 ### Todo
-- [ ] Add/implement stack (stack will indicate empty positions in `fds` array)
+- [x] Add/implement stack (stack will indicate empty positions in `fds` array)
 - [ ] Make requests to target
 - [ ] Store request results in dictionary
 - [ ] CRON-like mechanism for freeing memory in dicitonary
 - [ ] Returning dict contents if possible
 - [ ] Tests
+##### Nice to have
+- [ ] Resolve non-blocking issues
+- [ ] Better error handling with `strerror`
 
 ### License
 [MIT License](https://opensource.org/licenses/MIT) © Marcin Elantkowski, Rafał Wiliński
