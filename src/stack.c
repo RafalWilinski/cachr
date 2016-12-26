@@ -1,18 +1,7 @@
-/*
- *          File: stack.c
- *        Author: Robert I. Pitts <rip@cs.bu.edu>
- * Last Modified: March 7, 2000
- *         Topic: Stack - Array Implementation
- * ----------------------------------------------------------------
- *
- * This is an array implementation of a character stack.
- */
-
 #include <stdio.h>
 #include <stdlib.h>  /* for dynamic allocation */
 #include "stack.h"
 
-/************************ Function Definitions **********************/
 
 void StackInit(stackT *stackP, int maxSize)
 {
