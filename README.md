@@ -19,8 +19,10 @@ make
 - [ ] CRON-like mechanism for freeing memory in dicitonary
 - [ ] Returning dict contents if possible
 - [ ] Tests
+- [x] Dummy target server in Node
+
 ##### Nice to have
-- [ ] Resolve non-blocking issues
+- [x] Resolve non-blocking issues
 - [ ] Better error handling with `strerror`
 
 ### License

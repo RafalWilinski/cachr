@@ -146,60 +146,77 @@ char* parse_response(char* response) {
 }
 
 target_request* tcp_request(char* request_data) {
-  struct sockaddr_in sck_addr;
-  pid_t pid;
   int status = 0, sck;
-  ssize_t bytes_read;
-  char buffer[1024];
+  char buffer[256];
+  pid_t pid;
 
   // Run on separate thread
   if ((pid = fork ()) == 0) {
-    memset (&sck_addr, 0, sizeof sck_addr);
-    sck_addr.sin_family = AF_INET;
-    inet_aton (cfg.target_host, &sck_addr.sin_addr);
-    sck_addr.sin_port = htons (cfg.target_port);
+    int sockfd;
+    ssize_t n;
+    struct sockaddr_in serv_addr;
+    struct hostent *server;
 
-    if ((sck = socket (PF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
-      handle_error(sck, errno, "Could not create socket for target request");
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+      handle_error(sockfd, errno, "ERROR opening socket");
       exit(EXIT_FAILURE);
     }
 
-    if (connect (sck, (struct sockaddr*) &sck_addr, sizeof sck_addr) < 0) {
-      handle_error(EHOSTUNREACH, EHOSTUNREACH, "Could not connect to host");
+    server = gethostbyname(cfg.target_host);
+
+    if (server == NULL) {
+      handle_error(-1, EHOSTUNREACH, "No such host");
       exit(EXIT_FAILURE);
     }
 
-    printf("Requesting %s:%d...\n", cfg.target_host, cfg.target_port);
+    bzero((char *) &serv_addr, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    bcopy(server->h_addr, (char *) &serv_addr.sin_addr.s_addr, (size_t) server->h_length);
+    serv_addr.sin_port = htons(cfg.target_port);
 
-    // Send request data
-    // ssize_t write_status = write(sck, request_data, sizeof(request_data));
-    // printf("written: %d", (int) write_status);
+    printf("Connecting to %s:%d\n", cfg.target_host, cfg.target_port);
 
-    // Receive response from server
-    while ((bytes_read = read (sck,  buffer, 1024)) > 0)
-      write (1, buffer, (size_t) bytes_read);
+    if (connect(sockfd, (struct sockaddr*) &serv_addr, sizeof(serv_addr)) < 0) {
+      perror("ERROR connecting");
+      exit(EXIT_FAILURE);
+    }
 
-    printf("Data from target received: %s\n", buffer);
-    close (sck);
+    printf("Sending: %s", request_data);
+
+    n = write(sockfd, request_data, strlen(request_data));
+
+    if (n < 0) {
+      perror("ERROR writing to socket");
+      exit(EXIT_FAILURE);
+    }
+
+    /* Now read server response */
+    bzero(buffer,256);
+    n = read(sockfd, buffer, 255);
+
+    if (n < 0) {
+      perror("ERROR reading from socket");
+      exit(1);
+    }
+
+    printf("%s\n",buffer);
     exit(EXIT_SUCCESS);
   }
 
   waitpid(pid, &status, WCONTINUED);
 
-  target_request *resp = malloc(sizeof(target_request));
-
   if(WIFEXITED(status)) {
     if(WEXITSTATUS(status) == 0) {
-      memcpy(buffer, resp->data, sizeof(buffer));
-      resp->status = 1;
+      // Success
     } else {
-      resp->status = -1;
+      // Handle error
     }
   } else {
-    resp->status = -1;
+    // Handle error
   }
 
-  return resp;
+  return 0;
 }
 
 
