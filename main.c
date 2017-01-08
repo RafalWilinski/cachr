@@ -5,7 +5,10 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/fcntl.h>
+#include <sys/mman.h>
+#include <sys/types.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 
 #include "src/dict.h"
 #include "src/ini.h"
@@ -34,17 +37,9 @@ typedef struct {
 configuration cfg;
 
 typedef struct {
-  const char* host;
-  const char* type;
-  const char* content_length;
-  const char* etag;
-  const char* data;
-} http_request;
-
-typedef struct {
-  const char* data;
+  char* data;
   short status;
-} target_request;
+} target_response;
 
 static int config_handler(void *user, const char *section, const char *name, const char *value) {
   configuration *pconfig = (configuration *) user;
@@ -136,87 +131,92 @@ int prepare_in_sock(configuration cfg) {
   return -1;
 }
 
-char* parse_response(char* response) {
-  char *token = NULL;
-  token = strtok(response, "\n");
-  while (token) {
-    printf("Current token: %s.\n", token);
-    token = strtok(NULL, "\n");
+void* threaded_tcp_connection(void *_request_data) {
+  int sockfd;
+  ssize_t n;
+  char* request_data = (char*)_request_data;
+  target_response* response = (target_response*) malloc(sizeof(target_response));
+  response->data = malloc(1024);
+  struct sockaddr_in serv_addr;
+  struct hostent *server;
+
+  sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sockfd < 0) {
+    handle_error(sockfd, errno, "ERROR opening socket");
+
+    response->status = EXIT_FAILURE;
+    return response;
   }
+
+  server = gethostbyname(cfg.target_host);
+
+  if (server == NULL) {
+    handle_error(1, EHOSTUNREACH, "No such host");
+
+    response->status = EXIT_FAILURE;
+    return response;
+  }
+
+  bzero((char *) &serv_addr, sizeof(serv_addr));
+  serv_addr.sin_family = AF_INET;
+  bcopy(server->h_addr, (char *) &serv_addr.sin_addr.s_addr, (size_t) server->h_length);
+  serv_addr.sin_port = htons(cfg.target_port);
+
+  printf("Connecting to %s:%d\n", cfg.target_host, cfg.target_port);
+
+  if (connect(sockfd, (struct sockaddr*) &serv_addr, sizeof(serv_addr)) < 0) {
+    handle_error(1, errno, "Error while connecting");
+
+    response->status = EXIT_FAILURE;
+    return response;
+  }
+
+  n = write(sockfd, request_data, strlen(request_data));
+
+  if (n < 0) {
+    handle_error((int) n, errno, "Error while writing data to socket");
+
+    response->status = EXIT_SUCCESS;
+    return response;
+  } else {
+    printf("Sent! Bytes: %zi\n", n);
+    printf("Sent payload: \n%s\n---\n", request_data);
+  }
+
+  /* Now read server response */
+  printf("Resetting buffer...\n");
+  bzero(buffer, 1024);
+  printf("Reading from sock...\n");
+  n = read(sockfd, response->data, 1023);
+
+  if (n < 0) {
+    handle_error((int) n, errno, "Error while reading data from socket");
+
+    response->status = EXIT_FAILURE;
+    return response;
+  } else {
+    printf("Downloaded! Bytes read: %zi\n", n);
+  }
+
+  response->status = EXIT_SUCCESS;
+  return response;
 }
 
-target_request* tcp_request(char* request_data) {
-  int status = 0, sck;
-  char buffer[256];
-  pid_t pid;
+
+target_response * tcp_request(char* request_data) {
+  target_response* response = (target_response*) malloc(sizeof(target_response));
 
   // Run on separate thread
-  if ((pid = fork ()) == 0) {
-    int sockfd;
-    ssize_t n;
-    struct sockaddr_in serv_addr;
-    struct hostent *server;
-
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) {
-      handle_error(sockfd, errno, "ERROR opening socket");
-      exit(EXIT_FAILURE);
-    }
-
-    server = gethostbyname(cfg.target_host);
-
-    if (server == NULL) {
-      handle_error(-1, EHOSTUNREACH, "No such host");
-      exit(EXIT_FAILURE);
-    }
-
-    bzero((char *) &serv_addr, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    bcopy(server->h_addr, (char *) &serv_addr.sin_addr.s_addr, (size_t) server->h_length);
-    serv_addr.sin_port = htons(cfg.target_port);
-
-    printf("Connecting to %s:%d\n", cfg.target_host, cfg.target_port);
-
-    if (connect(sockfd, (struct sockaddr*) &serv_addr, sizeof(serv_addr)) < 0) {
-      perror("ERROR connecting");
-      exit(EXIT_FAILURE);
-    }
-
-    printf("Sending: %s", request_data);
-
-    n = write(sockfd, request_data, strlen(request_data));
-
-    if (n < 0) {
-      perror("ERROR writing to socket");
-      exit(EXIT_FAILURE);
-    }
-
-    /* Now read server response */
-    bzero(buffer,256);
-    n = read(sockfd, buffer, 255);
-
-    if (n < 0) {
-      perror("ERROR reading from socket");
-      exit(1);
-    }
-
-    printf("%s\n",buffer);
-    exit(EXIT_SUCCESS);
+  pthread_t id;
+  errno = pthread_create(&id, NULL, threaded_tcp_connection, (void*)request_data);
+  if (errno > 0) {
+    handle_error(1, errno, "Failed to create call pthread_create");
   }
-
-  waitpid(pid, &status, WCONTINUED);
-
-  if(WIFEXITED(status)) {
-    if(WEXITSTATUS(status) == 0) {
-      // Success
-    } else {
-      // Handle error
-    }
-  } else {
-    // Handle error
+  errno = pthread_join(id, (void **) &response);
+  if (errno > 0) {
+    handle_error(1, errno, "Failed to create call pthread_join");
   }
-
-  return 0;
+  return response;
 }
 
 
@@ -238,8 +238,6 @@ void run(int listen_sck_fd, configuration cfg) {
   printf("Server started. Maximum concurrent connections: %d\n", cfg.fds_count);
 
   while (poll(fds, (nfds_t) sck_cnt, -1)) {
-    printf("Poll!\n");
-
     for (i = 0; i < upperBound; i++) {
       if (i == 0) {
         fds[i].revents = 0;
@@ -277,18 +275,29 @@ void run(int listen_sck_fd, configuration cfg) {
           fds[i].revents = 0;
 
           printf("New request: %s\nFrom #%d [fd: %d]\n", buffer, i, fds[i].fd);
-          parse_response(buffer);
 
           // Find in cache
           // If not found request & respond
           // Else respond with content from cache
           // Close socket
 
-          target_request *payload = tcp_request(buffer);
-          printf("Status: %d, Payload: %s", payload->status, payload->data);
+          target_response *payload = tcp_request(buffer);
+          if (payload) {
+            printf("\nStatus: %d, Payload: \n%s\n---\n", payload->status, payload->data);
+
+            ssize_t sent_bytes = write(fds[i].fd, payload->data, 1024);
+            if (sent_bytes > 0) {
+
+            } else {
+              printf("Failed to make request to target...\n");
+            }
+          } else {
+            printf("Failed to make request to target...\n");
+          }
 
           close(fds[i].fd);
           StackPush(&freeIndexesStack, (stackElementT) i);
+          free(payload);
 
           printf("Connection closed. Fd: %d, idx: %d\n", fds[i].fd, i);
         } else {
