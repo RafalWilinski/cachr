@@ -5,8 +5,6 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/fcntl.h>
-#include <sys/mman.h>
-#include <sys/types.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 
@@ -17,6 +15,7 @@
 
 #define BUFSIZE 1024
 char buffer[BUFSIZE];
+dict* cache;
 
 struct sockaddr_in cli_addr;
 
@@ -274,30 +273,43 @@ void run(int listen_sck_fd, configuration cfg) {
         if (bufsize > 0) {
           fds[i].revents = 0;
 
-          printf("New request: %s\nFrom #%d [fd: %d]\n", buffer, i, fds[i].fd);
+          printf("New request: \n%s\nFrom #%d [fd: %d]\n---\n", buffer, i, fds[i].fd);
 
-          // Find in cache
-          // If not found request & respond
-          // Else respond with content from cache
-          // Close socket
+          node* entry = dict_get(cache, buffer);
+          if (entry) {
+            printf("Serving response from cache\n");
 
-          target_response *payload = tcp_request(buffer);
-          if (payload) {
-            printf("\nStatus: %d, Payload: \n%s\n---\n", payload->status, payload->data);
-
-            ssize_t sent_bytes = write(fds[i].fd, payload->data, 1024);
+            ssize_t sent_bytes = write(fds[i].fd, entry->value, 1024);
             if (sent_bytes > 0) {
-
+              printf("%d bytes sent to requester\n", (int) sent_bytes);
             } else {
               printf("Failed to make request to target...\n");
             }
           } else {
-            printf("Failed to make request to target...\n");
+            target_response *payload = tcp_request(buffer);
+            if (payload) {
+              printf("\nStatus: %d, Payload: \n%s\n---\n", payload->status, payload->data);
+
+              if (payload->status == 0) {
+                printf("Response saved to internal cache\n");
+                dict_add(cache, buffer, payload->data);
+              }
+
+              ssize_t sent_bytes = write(fds[i].fd, payload->data, 1024);
+              if (sent_bytes > 0) {
+                printf("%d bytes sent to requester\n", (int) sent_bytes);
+              } else {
+                printf("Failed to make request to target...\n");
+              }
+
+              free(payload);
+            } else {
+              printf("Failed to make request to target...\n");
+            }
           }
 
           close(fds[i].fd);
           StackPush(&freeIndexesStack, (stackElementT) i);
-          free(payload);
 
           printf("Connection closed. Fd: %d, idx: %d\n", fds[i].fd, i);
         } else {
@@ -324,6 +336,8 @@ int main(int argc, char **argv) {
 
   printf("Cachr started with config from '%s': host=%s, port=%s...\n",
          config_name, cfg.listen_host, cfg.listen_port);
+
+  cache = dict_new();
 
   int listen_sck = prepare_in_sock(cfg);
   if (listen_sck < 0) {

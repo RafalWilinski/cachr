@@ -14,8 +14,8 @@ make
 
 ### Todo
 - [x] Add/implement stack (stack will indicate empty positions in `fds` array)
-- [ ] Make requests to target
-- [ ] Store request results in dictionary
+- [x] Make requests to target
+- [x] Store request results in dictionary
 - [ ] CRON-like mechanism for freeing memory in dicitonary
 - [ ] Returning dict contents if possible
 - [ ] Tests
