@@ -16,8 +16,7 @@
 #define BUFSIZE 1024
 char buffer[BUFSIZE];
 dict* cache;
-
-struct sockaddr_in cli_addr;
+struct sockaddr_in target_serv_addr;
 
 /* Number of sockets connected in fds array */
 int sck_cnt = 1;
@@ -87,9 +86,9 @@ int prepare_in_sock(configuration cfg) {
   int s, sfd;
 
   memset (&hints, 0, sizeof(struct addrinfo));
-  hints.ai_family = AF_UNSPEC;     /* Return IPv4 and IPv6 choices */
+  hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
-  hints.ai_flags = AI_PASSIVE;     /* All interfaces */
+  hints.ai_flags = AI_PASSIVE;
 
   s = getaddrinfo(cfg.listen_host, cfg.listen_port, &hints, &result);
   if (s != 0) {
@@ -97,7 +96,6 @@ int prepare_in_sock(configuration cfg) {
     return -1;
   }
 
-  /* Iterate through all "suggestions" and find suitable IPs */
   for (rp = result; rp != NULL; rp = rp->ai_next) {
     sfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
     if (sfd == -1)
@@ -130,14 +128,31 @@ int prepare_in_sock(configuration cfg) {
   return -1;
 }
 
+struct sockaddr_in get_server_addr() {
+  struct sockaddr_in serv_addr;
+  struct hostent *server;
+
+  server = gethostbyname(cfg.target_host);
+  if (server == NULL) {
+    handle_error(1, EHOSTUNREACH, "No such host");
+
+    return NULL;
+  }
+
+  bzero((char *) &serv_addr, sizeof(serv_addr));
+  serv_addr.sin_family = AF_INET;
+  bcopy(server->h_addr, (char *) &serv_addr.sin_addr.s_addr, (size_t) server->h_length);
+  serv_addr.sin_port = htons(cfg.target_port);
+
+  return serv_addr;
+}
+
 void* threaded_tcp_connection(void *_request_data) {
   int sockfd;
   ssize_t n;
   char* request_data = (char*)_request_data;
   target_response* response = (target_response*) malloc(sizeof(target_response));
   response->data = malloc(1024);
-  struct sockaddr_in serv_addr;
-  struct hostent *server;
 
   sockfd = socket(AF_INET, SOCK_STREAM, 0);
   if (sockfd < 0) {
@@ -147,23 +162,9 @@ void* threaded_tcp_connection(void *_request_data) {
     return response;
   }
 
-  server = gethostbyname(cfg.target_host);
-
-  if (server == NULL) {
-    handle_error(1, EHOSTUNREACH, "No such host");
-
-    response->status = EXIT_FAILURE;
-    return response;
-  }
-
-  bzero((char *) &serv_addr, sizeof(serv_addr));
-  serv_addr.sin_family = AF_INET;
-  bcopy(server->h_addr, (char *) &serv_addr.sin_addr.s_addr, (size_t) server->h_length);
-  serv_addr.sin_port = htons(cfg.target_port);
-
   printf("Connecting to %s:%d\n", cfg.target_host, cfg.target_port);
 
-  if (connect(sockfd, (struct sockaddr*) &serv_addr, sizeof(serv_addr)) < 0) {
+  if (connect(sockfd, (struct sockaddr*) &target_serv_addr, sizeof(target_serv_addr)) < 0) {
     handle_error(1, errno, "Error while connecting");
 
     response->status = EXIT_FAILURE;
@@ -223,7 +224,9 @@ void run(int listen_sck_fd, configuration cfg) {
   int upperBound = 1;
   socklen_t clilen;
   stackT freeIndexesStack;
+  struct sockaddr_in cli_addr;
   struct pollfd *fds = (struct pollfd *) calloc(cfg.fds_count, sizeof(struct pollfd));
+
   StackInit(&freeIndexesStack, cfg.fds_count);
 
   fds[0].fd = listen_sck_fd;
@@ -235,6 +238,12 @@ void run(int listen_sck_fd, configuration cfg) {
   }
 
   printf("Server started. Maximum concurrent connections: %d\n", cfg.fds_count);
+
+  struct sockaddr_in target_serv_addr = get_server_addr();
+  if (target_serv_addr.sin_addr.s_addr == NULL) {
+    handle_error(1, errno, "Failed to create sockaddr_in structure");
+    exit(EXIT_FAILURE);
+  }
 
   while (poll(fds, (nfds_t) sck_cnt, -1)) {
     for (i = 0; i < upperBound; i++) {
@@ -308,13 +317,13 @@ void run(int listen_sck_fd, configuration cfg) {
             }
           }
 
-          close(fds[i].fd);
-          StackPush(&freeIndexesStack, (stackElementT) i);
-
           printf("Connection closed. Fd: %d, idx: %d\n", fds[i].fd, i);
         } else {
           printf("Nothing to read on fds #%d, idx: %d\n, bufsize: %d", fds[i].fd, i, (int) bufsize);
         }
+
+        close(fds[i].fd);
+        StackPush(&freeIndexesStack, (stackElementT) i);
       }
     }
   }
