@@ -36,7 +36,7 @@ typedef struct {
 configuration cfg;
 
 struct cache_entry {
-  char key[33];
+  u_int64_t key;
   char* buffer;
   long timestamp;
   struct UT_hash_handle hh;
@@ -76,9 +76,9 @@ long get_timestamp() {
   return ms;
 }
 
-int hash_buffer(char* str) {
-  int c, hash = 2317;
-  while ((c = *str++)) {
+u_int64_t hash_buffer(char* str) {
+  u_int64_t c, hash = 2317;
+  while ((c = (u_int64_t) *str++)) {
     hash = ((hash << 5) + hash) + c;
   }
 
@@ -246,7 +246,7 @@ target_response * tcp_request(char* request_data) {
 
 void run(int listen_sck_fd, configuration cfg) {
   int upperBound = 1;
-  char key[33];
+  u_int64_t key;
   socklen_t clilen;
   stackT freeIndexesStack;
   struct sockaddr_in cli_addr;
@@ -310,11 +310,10 @@ void run(int listen_sck_fd, configuration cfg) {
           printf("New request: \n%s\nFrom #%d [fd: %d]\n---\n", buffer, i, fds[i].fd);
 
           struct cache_entry* found_entry = NULL;
-          memcpy(key, &buffer[0], 32);
-          key[32] = '\0';
+          key = hash_buffer(buffer);
 
-          printf("Finding key: %s\n", key);
-          HASH_FIND_STR(cache, &key, found_entry);
+          printf("Finding key: %llu\n", key);
+          HASH_FIND_INT(cache, &key, found_entry);
 
           if (found_entry) {
             printf("Serving response from cache\n");
@@ -336,11 +335,11 @@ void run(int listen_sck_fd, configuration cfg) {
                 printf("Response saved to internal cache\n");
 
                 struct cache_entry* entry = (struct cache_entry*) malloc(sizeof(struct cache_entry));
-                strncpy(entry->key, &key, 32);
+                entry->key = key;
                 entry->buffer = payload->data;
                 entry->timestamp = get_timestamp();
 
-                HASH_ADD_STR(cache, key, entry);
+                HASH_ADD_INT(cache, key, entry);
                 printf("add!\n");
               }
 
