@@ -14,9 +14,16 @@
 #include "src/stack.h"
 #include "src/uthash.h"
 
-#define BUFSIZE 1024
-char buffer[BUFSIZE];
+/* Size of buffer/chunk read */
+#define BUFSIZE 4096
+
+/* Constant message send with every tcp request */
+static const char CONNECTION_CLOSE_MSG[] = "Connection: close";
+
+/* Cached sockaddr_in structure as we're calling the same target */
 struct sockaddr_in target_serv_addr;
+
+/* Head of our structure */
 struct cache_entry *cache = NULL;
 
 /* Number of sockets connected in fds array */
@@ -39,12 +46,14 @@ struct cache_entry {
   u_int64_t key;
   char* buffer;
   long timestamp;
+  u_int32_t bytes;
   struct UT_hash_handle hh;
 };
 
 typedef struct {
   char* data;
   short status;
+  u_int32_t bytes;
 } target_response;
 
 static int config_handler(void *user, const char *section, const char *name, const char *value) {
@@ -172,11 +181,11 @@ struct sockaddr_in get_server_addr() {
 }
 
 void* threaded_tcp_connection(void *_request_data) {
-  int sockfd;
+  int sockfd, bytes_read = 0;
   ssize_t n;
   char* request_data = (char*)_request_data;
   target_response* response = (target_response*) malloc(sizeof(target_response));
-  response->data = malloc(1024);
+  response->data = malloc(sizeof(char) * BUFSIZE);
 
   sockfd = socket(AF_INET, SOCK_STREAM, 0);
   if (sockfd < 0) {
@@ -197,6 +206,10 @@ void* threaded_tcp_connection(void *_request_data) {
 
   n = write(sockfd, request_data, strlen(request_data));
 
+  // Because we don't want to mess with parsing HTTP responses we are explicitly sending `Connection: close msg`
+  write(sockfd, CONNECTION_CLOSE_MSG, sizeof(CONNECTION_CLOSE_MSG));
+  write(sockfd, cfg.listen_host, sizeof(cfg.listen_host));
+
   if (n < 0) {
     handle_error((int) n, errno, "Error while writing data to socket");
 
@@ -207,11 +220,13 @@ void* threaded_tcp_connection(void *_request_data) {
     printf("Sent payload: \n%s\n---\n", request_data);
   }
 
-  /* Now read server response */
-  printf("Resetting buffer...\n");
-  bzero(buffer, 1024);
   printf("Reading from sock...\n");
-  n = read(sockfd, response->data, 1023);
+  while((n = read(sockfd, response->data + bytes_read, BUFSIZE)) > 0) {
+    printf("Reading... %zi\n", n);
+    bytes_read += n;
+  }
+
+  close(sockfd);
 
   if (n < 0) {
     handle_error((int) n, errno, "Error while reading data from socket");
@@ -219,7 +234,8 @@ void* threaded_tcp_connection(void *_request_data) {
     response->status = EXIT_FAILURE;
     return response;
   } else {
-    printf("Downloaded! Bytes read: %zi\n", n);
+    printf("Downloaded! Bytes read: %i\n", bytes_read);
+    response->bytes = (u_int32_t) bytes_read;
   }
 
   response->status = EXIT_SUCCESS;
@@ -247,6 +263,7 @@ target_response * tcp_request(char* request_data) {
 void run(int listen_sck_fd, configuration cfg) {
   int upperBound = 1;
   u_int64_t key;
+  char buffer[BUFSIZE];
   socklen_t clilen;
   stackT freeIndexesStack;
   struct sockaddr_in cli_addr;
@@ -318,7 +335,7 @@ void run(int listen_sck_fd, configuration cfg) {
           if (found_entry) {
             printf("Serving response from cache\n");
 
-            ssize_t sent_bytes = write(fds[i].fd, found_entry->buffer, 1024);
+            ssize_t sent_bytes = write(fds[i].fd, found_entry->buffer, found_entry->bytes);
             if (sent_bytes > 0) {
               printf("%d bytes sent to requester\n", (int) sent_bytes);
             } else {
@@ -332,18 +349,17 @@ void run(int listen_sck_fd, configuration cfg) {
               printf("\nStatus: %d, Payload: \n%s\n---\n", payload->status, payload->data);
 
               if (payload->status == 0) {
-                printf("Response saved to internal cache\n");
-
                 struct cache_entry* entry = (struct cache_entry*) malloc(sizeof(struct cache_entry));
                 entry->key = key;
                 entry->buffer = payload->data;
                 entry->timestamp = get_timestamp();
+                entry->bytes = payload->bytes;
 
                 HASH_ADD_INT(cache, key, entry);
-                printf("add!\n");
+                printf("Response saved to internal cache\n");
               }
 
-              ssize_t sent_bytes = write(fds[i].fd, payload->data, 1024);
+              ssize_t sent_bytes = write(fds[i].fd, payload->data, payload->bytes);
               if (sent_bytes > 0) {
                 printf("%d bytes sent to requester\n", (int) sent_bytes);
               } else {
