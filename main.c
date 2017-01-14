@@ -7,16 +7,17 @@
 #include <sys/fcntl.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <sys/time.h>
 
-#include "src/dict.h"
 #include "src/ini.h"
 #include "src/error.h"
 #include "src/stack.h"
+#include "src/uthash.h"
 
 #define BUFSIZE 1024
 char buffer[BUFSIZE];
-dict* cache;
 struct sockaddr_in target_serv_addr;
+struct cache_entry *cache = NULL;
 
 /* Number of sockets connected in fds array */
 int sck_cnt = 1;
@@ -33,6 +34,13 @@ typedef struct {
 } configuration;
 
 configuration cfg;
+
+struct cache_entry {
+  char key[33];
+  char* buffer;
+  long timestamp;
+  struct UT_hash_handle hh;
+};
 
 typedef struct {
   char* data;
@@ -59,6 +67,22 @@ static int config_handler(void *user, const char *section, const char *name, con
     return 0;
   }
   return 1;
+}
+
+long get_timestamp() {
+  struct timeval tp;
+  gettimeofday(&tp, NULL);
+  long int ms = tp.tv_sec * 1000 + tp.tv_usec / 1000;
+  return ms;
+}
+
+int hash_buffer(char* str) {
+  int c, hash = 2317;
+  while ((c = *str++)) {
+    hash = ((hash << 5) + hash) + c;
+  }
+
+  return hash;
 }
 
 int make_socket_non_blocking(int sfd) {
@@ -136,7 +160,7 @@ struct sockaddr_in get_server_addr() {
   if (server == NULL) {
     handle_error(1, EHOSTUNREACH, "No such host");
 
-    return NULL;
+    exit(0);
   }
 
   bzero((char *) &serv_addr, sizeof(serv_addr));
@@ -222,6 +246,7 @@ target_response * tcp_request(char* request_data) {
 
 void run(int listen_sck_fd, configuration cfg) {
   int upperBound = 1;
+  char key[33];
   socklen_t clilen;
   stackT freeIndexesStack;
   struct sockaddr_in cli_addr;
@@ -239,7 +264,7 @@ void run(int listen_sck_fd, configuration cfg) {
 
   printf("Server started. Maximum concurrent connections: %d\n", cfg.fds_count);
 
-  struct sockaddr_in target_serv_addr = get_server_addr();
+  target_serv_addr = get_server_addr();
   if (target_serv_addr.sin_addr.s_addr == NULL) {
     handle_error(1, errno, "Failed to create sockaddr_in structure");
     exit(EXIT_FAILURE);
@@ -284,24 +309,39 @@ void run(int listen_sck_fd, configuration cfg) {
 
           printf("New request: \n%s\nFrom #%d [fd: %d]\n---\n", buffer, i, fds[i].fd);
 
-          node* entry = dict_get(cache, buffer);
-          if (entry) {
+          struct cache_entry* found_entry = NULL;
+          memcpy(key, &buffer[0], 32);
+          key[32] = '\0';
+
+          printf("Finding key: %s\n", key);
+          HASH_FIND_STR(cache, &key, found_entry);
+
+          if (found_entry) {
             printf("Serving response from cache\n");
 
-            ssize_t sent_bytes = write(fds[i].fd, entry->value, 1024);
+            ssize_t sent_bytes = write(fds[i].fd, found_entry->buffer, 1024);
             if (sent_bytes > 0) {
               printf("%d bytes sent to requester\n", (int) sent_bytes);
             } else {
               printf("Failed to make request to target...\n");
             }
           } else {
+            printf("Not found in cache!\n");
+
             target_response *payload = tcp_request(buffer);
             if (payload) {
               printf("\nStatus: %d, Payload: \n%s\n---\n", payload->status, payload->data);
 
               if (payload->status == 0) {
                 printf("Response saved to internal cache\n");
-                dict_add(cache, buffer, payload->data);
+
+                struct cache_entry* entry = (struct cache_entry*) malloc(sizeof(struct cache_entry));
+                strncpy(entry->key, &key, 32);
+                entry->buffer = payload->data;
+                entry->timestamp = get_timestamp();
+
+                HASH_ADD_STR(cache, key, entry);
+                printf("add!\n");
               }
 
               ssize_t sent_bytes = write(fds[i].fd, payload->data, 1024);
@@ -345,8 +385,6 @@ int main(int argc, char **argv) {
 
   printf("Cachr started with config from '%s': host=%s, port=%s...\n",
          config_name, cfg.listen_host, cfg.listen_port);
-
-  cache = dict_new();
 
   int listen_sck = prepare_in_sock(cfg);
   if (listen_sck < 0) {

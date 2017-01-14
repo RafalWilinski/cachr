@@ -7,8 +7,6 @@ set (VERSION_MINOR 1)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
 
 set(SOURCE_FILES
-        src/dict.c
-        src/dict.h
         src/ini.c
         src/ini.h
         src/error.c
