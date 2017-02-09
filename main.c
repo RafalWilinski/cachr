@@ -50,6 +50,12 @@ struct cache_entry {
   struct UT_hash_handle hh;
 };
 
+struct pthread_create_args {
+  char* request_data;
+  u_int64_t key;
+  int fd;
+};
+
 typedef struct {
   char* data;
   short status;
@@ -180,10 +186,11 @@ struct sockaddr_in get_server_addr() {
   return serv_addr;
 }
 
-void* threaded_tcp_connection(void *_request_data) {
+void* threaded_tcp_connection(void *_arguments) {
+  struct pthread_create_args *args = _arguments;
   int sockfd, bytes_read = 0;
   ssize_t n;
-  char* request_data = (char*)_request_data;
+  char* request_data = args->request_data;
   target_response* response = (target_response*) malloc(sizeof(target_response));
   response->data = malloc(sizeof(char) * BUFSIZE);
 
@@ -207,8 +214,8 @@ void* threaded_tcp_connection(void *_request_data) {
   n = write(sockfd, request_data, strlen(request_data));
 
   // Because we don't want to mess with parsing HTTP responses we are explicitly sending `Connection: close msg`
-  write(sockfd, CONNECTION_CLOSE_MSG, sizeof(CONNECTION_CLOSE_MSG));
-  write(sockfd, cfg.listen_host, sizeof(cfg.listen_host));
+//  write(sockfd, CONNECTION_CLOSE_MSG, sizeof(CONNECTION_CLOSE_MSG));
+//  write(sockfd, cfg.listen_host, sizeof(cfg.listen_host));
 
   if (n < 0) {
     handle_error((int) n, errno, "Error while writing data to socket");
@@ -230,33 +237,51 @@ void* threaded_tcp_connection(void *_request_data) {
 
   if (n < 0) {
     handle_error((int) n, errno, "Error while reading data from socket");
-
     response->status = EXIT_FAILURE;
-    return response;
   } else {
     printf("Downloaded! Bytes read: %i\n", bytes_read);
     response->bytes = (u_int32_t) bytes_read;
+    response->status = EXIT_SUCCESS;
   }
 
-  response->status = EXIT_SUCCESS;
-  return response;
+  if (response->status == 0) {
+    struct cache_entry* entry = (struct cache_entry*) malloc(sizeof(struct cache_entry));
+    entry->key = args->key;
+    entry->buffer = response->data;
+    entry->timestamp = get_timestamp();
+    entry->bytes = response->bytes;
+
+    HASH_ADD_INT(cache, key, entry);
+    printf("Response saved to internal cache\n");
+
+    ssize_t sent_bytes = write(args->fd, response->data, response->bytes);
+    if (sent_bytes > 0) {
+      printf("%d bytes sent to requester\n", (int) sent_bytes);
+    } else {
+      printf("Failed to make request to requester...\n %d", (int) sent_bytes);
+    }
+  } else {
+
+  }
+
+  close(args->fd);
+  free(response);
 }
 
 
-target_response * tcp_request(char* request_data) {
-  target_response* response = (target_response*) malloc(sizeof(target_response));
+void tcp_request(char* request_data, u_int64_t key, int fd) {
+  struct pthread_create_args args;
+  args.fd = fd;
+  args.key = key;
+  args.request_data = request_data;
 
   // Run on separate thread
   pthread_t id;
-  errno = pthread_create(&id, NULL, threaded_tcp_connection, (void*)request_data);
+  errno = pthread_create(&id, NULL, threaded_tcp_connection, (void*)&args);
   if (errno > 0) {
     handle_error(1, errno, "Failed to create call pthread_create");
   }
-  errno = pthread_join(id, (void **) &response);
-  if (errno > 0) {
-    handle_error(1, errno, "Failed to create call pthread_join");
-  }
-  return response;
+  pthread_detach(id);
 }
 
 
@@ -339,40 +364,12 @@ void run(int listen_sck_fd, configuration cfg) {
             if (sent_bytes > 0) {
               printf("%d bytes sent to requester\n", (int) sent_bytes);
             } else {
-              printf("Failed to make request to target...\n");
+              printf("Failed to respond to requester from cache... %d\n", (int) sent_bytes);
             }
           } else {
             printf("Not found in cache!\n");
-
-            target_response *payload = tcp_request(buffer);
-            if (payload) {
-              printf("\nStatus: %d, Payload: \n%s\n---\n", payload->status, payload->data);
-
-              if (payload->status == 0) {
-                struct cache_entry* entry = (struct cache_entry*) malloc(sizeof(struct cache_entry));
-                entry->key = key;
-                entry->buffer = payload->data;
-                entry->timestamp = get_timestamp();
-                entry->bytes = payload->bytes;
-
-                HASH_ADD_INT(cache, key, entry);
-                printf("Response saved to internal cache\n");
-              }
-
-              ssize_t sent_bytes = write(fds[i].fd, payload->data, payload->bytes);
-              if (sent_bytes > 0) {
-                printf("%d bytes sent to requester\n", (int) sent_bytes);
-              } else {
-                printf("Failed to make request to target...\n");
-              }
-
-              free(payload);
-            } else {
-              printf("Failed to make request to target...\n");
-            }
+            tcp_request(buffer, key, fds[i].fd);
           }
-
-          printf("Connection closed. Fd: %d, idx: %d\n", fds[i].fd, i);
         } else {
           printf("Nothing to read on fds #%d, idx: %d\n, bufsize: %d", fds[i].fd, i, (int) bufsize);
         }
@@ -404,6 +401,7 @@ int main(int argc, char **argv) {
   int listen_sck = prepare_in_sock(cfg);
   if (listen_sck < 0) {
     handle_error(1, errno, "listen_sck");
+    return EXIT_FAILURE;
   }
 
   run(listen_sck, cfg);
