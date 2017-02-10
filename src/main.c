@@ -22,8 +22,11 @@ static const char CONNECTION_CLOSE_MSG[] = "Connection: close";
 /* Cached sockaddr_in structure as we're calling the same target */
 struct sockaddr_in target_serv_addr;
 
-/* Head of our structure */
+/* Head of cache data structure */
 struct cache_entry *cache = NULL;
+
+/* Head of socket-request pairs dictionaryy structure */
+struct socket_request_pair *pairs = NULL;
 
 /* Number of sockets connected in fds array */
 int sck_cnt = 100;
@@ -40,6 +43,11 @@ struct cache_entry {
   long timestamp;
   u_int32_t bytes;
   struct UT_hash_handle hh;
+};
+
+struct socket_request_pair {
+  int key;
+  char* buffer;
 };
 
 int initialize_new_socket() {
@@ -116,9 +124,6 @@ void run(int listen_sck_fd, configuration cfg) {
       } else {
         printf("FD: %d - ", fds[i].fd);
         switch (fds[i].revents) {
-          case POLLPRI:
-            printf("POLLPRI\n");
-            break;
           case POLLHUP:
             printf("POLLHUP\n");
             break;
@@ -129,8 +134,6 @@ void run(int listen_sck_fd, configuration cfg) {
             printf("POLLNVAL\n");
             break;
           case POLLIN:
-            printf("POLLIN\n");
-
             char *buffer = malloc(BUFSIZE);
             buffer = memset(buffer, 0, BUFSIZE);
             size_t size = 0;
@@ -172,7 +175,6 @@ void run(int listen_sck_fd, configuration cfg) {
 
             /* Target Response */
             if (request_fds[fds[i].fd] > 0) {
-              printf("**** Target response\n");
               int requester_fds = request_fds[fds[i].fd];
               int data_source_fds = fds[i].fd;
               request_fds[data_source_fds] = 0;
@@ -185,7 +187,6 @@ void run(int listen_sck_fd, configuration cfg) {
             }
               /* Cachr Request */
             else {
-              printf("$$$ Cachr request\n");
               struct cache_entry *found_entry = NULL;
               key = hash_buffer(buffer);
 
