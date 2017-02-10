@@ -10,6 +10,8 @@ typedef struct {
 
   unsigned short fds_count;
   unsigned short non_blocking;
+
+  unsigned int ttl;
 } configuration;
 
 int config_handler(void *user, const char *section, const char *name, const char *value);

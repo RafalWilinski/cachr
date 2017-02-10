@@ -18,6 +18,8 @@ int config_handler(void *user, const char *section, const char *name, const char
     pconfig->fds_count = (unsigned short) atoi(value);
   } else if (MATCH("socket", "non_blocking")) {
     pconfig->non_blocking = (unsigned short) atoi(value);
+  } else if (MATCH("cache", "ttl")) {
+    pconfig->ttl = (unsigned short) atoi(value);
   } else {
     return 0;
   }

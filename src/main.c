@@ -4,11 +4,8 @@
 #include <errno.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <assert.h>
-#include <sys/ioctl.h>
 
 #include "libs/ini.h"
-#include "libs/picohttpparser.h"
 #include "error.h"
 #include "libs/stack.h"
 #include "libs/uthash.h"
@@ -193,10 +190,13 @@ void run(int listen_sck_fd, configuration cfg) {
               key = hash_buffer(buffer);
 
               HASH_FIND_INT(cache, &key, found_entry);
-              if (found_entry) {
+              if (found_entry && found_entry->timestamp + cfg.ttl > get_timestamp()) {
                 serve_response_from_cache(found_entry, fds[i].fd, i);
               } else {
                 printf("Not found in cache! Making request to target\n");
+                if (found_entry) {
+                  HASH_DEL(cache, found_entry);
+                }
 
                 int idx = StackPop(&freeIndexesStack);
                 int sockfd = initialize_new_socket();
