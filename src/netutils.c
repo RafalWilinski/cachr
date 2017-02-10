@@ -6,15 +6,7 @@
 #include "configutils.h"
 
 int make_socket_non_blocking(int sfd) {
-  int flags, s;
-
-  flags = fcntl(sfd, F_GETFL, 0);
-  if (flags == -1) {
-    return -1;
-  }
-
-  flags |= O_NONBLOCK;
-  s = fcntl(sfd, F_SETFL, flags);
+  int  s = fcntl(sfd, F_SETFL, O_NONBLOCK);
   if (s == -1) {
     return -1;
   }

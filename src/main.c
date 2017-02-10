@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <assert.h>
+#include <sys/ioctl.h>
 
 #include "libs/ini.h"
 #include "libs/picohttpparser.h"
@@ -68,37 +69,6 @@ void serve_response_from_cache(struct cache_entry *found_entry, int fd, int i) {
   StackPush(&freeIndexesStack, (stackElementT) i);
 }
 
-char* parse_response(int fd) {
-  char buffer[BUFSIZE], *message;
-  size_t buflen = 0, prevbuflen = 0, num_headers, message_len;
-  ssize_t rret;
-  struct phr_header headers[100];
-  int pret, minor_version, status;
-
-  while(1) {
-    while ((rret = read(fd, buffer + buflen, sizeof(buffer) - buflen)) == -1 && errno == EINTR)
-      ;
-    printf("BUffer: %s", buffer);
-    if (rret <= 0)
-      printf("io error\n");
-
-    prevbuflen = buflen;
-    buflen += rret;
-
-    pret = phr_parse_response(buffer, buflen, &minor_version, &status, &message, &message_len, &headers, &num_headers, prevbuflen);
-    if (pret > 0)
-      break; /* successfully parsed the request */
-    else if (pret == -1)
-      printf("parse error\n");
-    /* request is incomplete, continue the loop */
-    assert(pret == -2);
-    if (buflen == sizeof(buffer))
-      printf("too long error\n");
-  }
-
-  return buffer;
-}
-
 void run(int listen_sck_fd, configuration cfg) {
   int upperBound = 1;
   u_int64_t key;
@@ -135,7 +105,7 @@ void run(int listen_sck_fd, configuration cfg) {
           if (!StackIsEmpty(&freeIndexesStack)) {
             int idx = StackPop(&freeIndexesStack);
             fds[idx].fd = newsockfd;
-            fds[idx].events = POLLIN;
+            fds[idx].events = POLLIN | POLLPRI;
             make_socket_non_blocking(newsockfd);
 
             if (idx >= upperBound) upperBound = idx + 1;
@@ -147,88 +117,113 @@ void run(int listen_sck_fd, configuration cfg) {
           printf("Negative newsockfd! %d\n", newsockfd);
         }
       } else {
-        if (fds[i].revents > 0) {
-          printf("Incoming data! \n");
-          fds[i].revents = 0;
-          char *buffer = malloc(BUFSIZE);
-          size_t size = 0;
-          ssize_t rsize, capacity = BUFSIZE;
+        printf("FD: %d - ", fds[i].fd);
+        switch (fds[i].revents) {
+          case POLLPRI:
+            printf("POLLPRI\n");
+            break;
+          case POLLHUP:
+            printf("POLLHUP\n");
+            break;
+          case POLL_ERR:
+            printf("POLL_ERR!\n");
+            break;
+          case POLLNVAL:
+            printf("POLLNVAL\n");
+            break;
+          case POLLIN:
+            printf("POLLIN\n");
 
-          while((rsize = read(fds[i].fd, buffer + size, capacity - size))) {
-            if (rsize < 0) {
-              printf("End of stream error! %d\n", rsize);
-              break;
-            }
-            size += rsize;
-            printf("Reading: %d\n", (int) rsize);
+            char *buffer = malloc(BUFSIZE);
+            buffer = memset(buffer, 0, BUFSIZE);
+            size_t size = 0;
+            ssize_t rsize = 0, capacity = BUFSIZE;
 
-            if (size == capacity) {
-              printf("Reallocating to capacity=%d\n", (int) (capacity * 2));
-              capacity *= 2;
-              buffer = realloc(buffer, (size_t) capacity);
+            printf("reading...\n");
 
-              if (buffer == NULL) {
-                printf("Failed to rellocate the buffer!\n");
+            while ((rsize = read(fds[i].fd, buffer + size, capacity - size)) != -1 && rsize != 0) {
+              if (rsize == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return;
+              }
+
+              if (rsize < 0) {
+                printf("End of stream error! %d\n", rsize);
+                break;
+              }
+              size += rsize;
+              printf("Reading: %d\n", (int) rsize);
+
+              if (size == capacity) {
+                printf("Reallocating to capacity=%d\n", (int) (capacity * 2));
+                capacity *= 2;
+                buffer = realloc(buffer, (size_t) capacity);
+
+                if (buffer == NULL) {
+                  printf("Failed to rellocate the buffer!\n");
+                }
               }
             }
-          }
 
-          printf("Bytes read: %d, %d\n", (int) size, (int) rsize);
-          printf("Buffer: %s\n\n", buffer);
-
-          /* Target Response */
-          if (request_fds[fds[i].fd] > 0) {
-            printf("**** Target response\n");
-            int requester_fds = request_fds[fds[i].fd];
-            int data_source_fds = fds[i].fd;
-            request_fds[data_source_fds] = 0;
-
-            int ws = (int) write(requester_fds, buffer, strlen(buffer));
-            printf("write status: %d\n", ws);
-            close(data_source_fds);
-            close(requester_fds);
-            StackPush(&freeIndexesStack, i);
-          }
-          /* Cachr Request */
-          else {
-            printf("$$$ Cachr request\n");
-            struct cache_entry *found_entry = NULL;
-            key = hash_buffer(buffer);
-
-            HASH_FIND_INT(cache, &key, found_entry);
-            if (found_entry) {
-              serve_response_from_cache(found_entry, fds[i].fd, i);
+            if (size > 0) {
+              printf("Marking %d as done...\n", fds[i].fd);
+              fds[i].revents = 0;
             } else {
-              printf("Not found in cache! Making request to target\n");
-
-              int idx = StackPop(&freeIndexesStack);
-              int sockfd = initialize_new_socket();
-//              make_socket_non_blocking(sockfd);
-
-              // TODO: Handle status
-              int ws = (int) write(sockfd, buffer, strlen(buffer));
-              printf("write status: %d\n", ws);
-              write(sockfd, CONNECTION_CLOSE_MSG, strlen(CONNECTION_CLOSE_MSG));
-              write(sockfd, cfg.target_host, strlen(cfg.target_host));
-
-              fds[idx].fd = sockfd;
-              fds[idx].events = POLLOUT & POLLIN;
-              fds[idx].revents = 1;
-              sck_cnt = upperBound;
-
-              printf("fd: %d, idx: %d\n", fds[idx].fd, idx);
-
-              /* Add request to array of pending requests */
-              request_fds[sockfd] = fds[i].fd;
-
-              if (idx >= upperBound)
-                upperBound = idx + 1;
+              break;
             }
-          }
 
-          free(buffer);
-        } else {
-          printf("Nothing to do with idx: %d, fds: %d, revents: %d\n", i, fds[i].fd, fds[i].revents);
+            printf("Bytes read: %d, %d\n", (int) size, (int) rsize);
+
+            /* Target Response */
+            if (request_fds[fds[i].fd] > 0) {
+              printf("**** Target response\n");
+              int requester_fds = request_fds[fds[i].fd];
+              int data_source_fds = fds[i].fd;
+              request_fds[data_source_fds] = 0;
+
+              int ws = (int) write(requester_fds, buffer, strlen(buffer));
+              printf("write status: %d\n", ws);
+              close(data_source_fds);
+              close(requester_fds);
+              StackPush(&freeIndexesStack, i);
+            }
+              /* Cachr Request */
+            else {
+              printf("$$$ Cachr request\n");
+              struct cache_entry *found_entry = NULL;
+              key = hash_buffer(buffer);
+
+              HASH_FIND_INT(cache, &key, found_entry);
+              if (found_entry) {
+                serve_response_from_cache(found_entry, fds[i].fd, i);
+              } else {
+                printf("Not found in cache! Making request to target\n");
+
+                int idx = StackPop(&freeIndexesStack);
+                int sockfd = initialize_new_socket();
+
+                int ws = (int) write(sockfd, buffer, strlen(buffer));
+                printf("write status: %d\n", ws);
+                write(sockfd, CONNECTION_CLOSE_MSG, strlen(CONNECTION_CLOSE_MSG));
+                write(sockfd, cfg.target_host, strlen(cfg.target_host));
+
+                fds[idx].fd = sockfd;
+                fds[idx].events = POLLIN;
+                fds[idx].revents = 1;
+                sck_cnt = upperBound;
+
+                printf("fd: %d, idx: %d\n", fds[idx].fd, idx);
+
+                /* Add request to array of pending requests */
+                request_fds[sockfd] = fds[i].fd;
+
+                if (idx >= upperBound)
+                  upperBound = idx + 1;
+              }
+            }
+
+            free(buffer);
+          default:
+            printf("default case revents\n");
         }
       }
     }
