@@ -4,15 +4,16 @@
 #include <errno.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <sys/time.h>
+#include <assert.h>
 
 #include "libs/ini.h"
+#include "libs/picohttpparser.h"
 #include "error.h"
 #include "libs/stack.h"
 #include "libs/uthash.h"
-#include "libs/picohttpparser.h"
 #include "configutils.h"
 #include "netutils.h"
+#include "utils.h"
 
 /* Size of buffer/chunk read */
 #define BUFSIZE 4096
@@ -27,8 +28,12 @@ struct sockaddr_in target_serv_addr;
 struct cache_entry *cache = NULL;
 
 /* Number of sockets connected in fds array */
-int sck_cnt = 10;
+int sck_cnt = 100;
 
+/* Stack of available indexes in fds array */
+stackT freeIndexesStack;
+
+/* Parsed configuration structure */
 configuration cfg;
 
 struct cache_entry {
@@ -39,41 +44,69 @@ struct cache_entry {
   struct UT_hash_handle hh;
 };
 
-struct request_proxy_request_pair {
-  int original_request_fd;
-  int proxied_request_fd;
-};
+int initialize_new_socket() {
+  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sockfd < 0)
+    handle_error(sockfd, errno, "ERROR opening socket");
 
-long get_timestamp() {
-  struct timeval tp;
-  gettimeofday(&tp, NULL);
-  long int ms = tp.tv_sec * 1000 + tp.tv_usec / 1000;
-  return ms;
+  printf("Connecting to %s:%d\n", cfg.target_host, cfg.target_port);
+
+  if (connect(sockfd, (struct sockaddr *) &target_serv_addr, sizeof(target_serv_addr)) < 0)
+    handle_error(1, errno, "Error while connecting");
+
+  return sockfd;
 }
 
-u_int64_t hash_buffer(char* str) {
-  u_int64_t c, hash = 2317;
-  while ((c = (u_int64_t) *str++)) {
-    hash = ((hash << 5) + hash) + c;
+void serve_response_from_cache(struct cache_entry *found_entry, int fd, int i) {
+  ssize_t sent_bytes = write(fd, found_entry->buffer, found_entry->bytes);
+  if (sent_bytes > 0)
+    printf("%d bytes sent to requester\n", (int) sent_bytes);
+  else
+    printf("Failed to respond to requester from cache... %d\n", (int) sent_bytes);
+
+  close(fd);
+  StackPush(&freeIndexesStack, (stackElementT) i);
+}
+
+char* parse_response(int fd) {
+  char buffer[BUFSIZE], *message;
+  size_t buflen = 0, prevbuflen = 0, num_headers, message_len;
+  ssize_t rret;
+  struct phr_header headers[100];
+  int pret, minor_version, status;
+
+  while(1) {
+    while ((rret = read(fd, buffer + buflen, sizeof(buffer) - buflen)) == -1 && errno == EINTR)
+      ;
+    printf("BUffer: %s", buffer);
+    if (rret <= 0)
+      printf("io error\n");
+
+    prevbuflen = buflen;
+    buflen += rret;
+
+    pret = phr_parse_response(buffer, buflen, &minor_version, &status, &message, &message_len, &headers, &num_headers, prevbuflen);
+    if (pret > 0)
+      break; /* successfully parsed the request */
+    else if (pret == -1)
+      printf("parse error\n");
+    /* request is incomplete, continue the loop */
+    assert(pret == -2);
+    if (buflen == sizeof(buffer))
+      printf("too long error\n");
   }
 
-  return hash;
+  return buffer;
 }
 
 void run(int listen_sck_fd, configuration cfg) {
   int upperBound = 1;
   u_int64_t key;
-  char buffer[BUFSIZE];
   socklen_t clilen;
-  stackT freeIndexesStack;
   struct sockaddr_in cli_addr;
   struct pollfd *fds = (struct pollfd *) calloc(cfg.fds_count, sizeof(struct pollfd));
-
-  char *method, *path;
-  int pret, minor_version;
-  struct phr_header headers[100];
-  size_t buflen = 0, prevbuflen = 0, method_len, path_len, num_headers;
-  ssize_t rret;
+  int request_fds[cfg.fds_count];
+  for(int j = 0; j < cfg.fds_count; j++) request_fds[j] = 0;
 
   StackInit(&freeIndexesStack, cfg.fds_count);
 
@@ -81,9 +114,8 @@ void run(int listen_sck_fd, configuration cfg) {
   fds[0].events = POLLIN;
 
   int i = 0;
-  for (i = cfg.fds_count - 1; i > 0; i--) {
+  for (i = cfg.fds_count - 1; i > 0; i--)
     StackPush(&freeIndexesStack, (stackElementT) (i));
-  }
 
   printf("Server started. Maximum concurrent connections: %d\n", cfg.fds_count);
 
@@ -95,8 +127,6 @@ void run(int listen_sck_fd, configuration cfg) {
 
   while (poll(fds, (nfds_t) sck_cnt, -1)) {
     for (i = 0; i < upperBound; i++) {
-      /* Server listening socket */
-      printf("%d/%d, fd: %d\n", i, upperBound, fds[i].fd);
       if (i == 0) {
         fds[i].revents = 0;
 
@@ -104,88 +134,101 @@ void run(int listen_sck_fd, configuration cfg) {
         if (newsockfd > 0) {
           if (!StackIsEmpty(&freeIndexesStack)) {
             int idx = StackPop(&freeIndexesStack);
-
             fds[idx].fd = newsockfd;
-            make_socket_non_blocking(newsockfd);
             fds[idx].events = POLLIN;
+            make_socket_non_blocking(newsockfd);
 
-            if (idx >= upperBound) {
-              upperBound = idx + 1;
-
-              printf("New upper bound: %d\n", upperBound);
-            }
-
-            printf("New connection on file descriptor #%d, idx: %d\n", fds[idx].fd, idx);
+            if (idx >= upperBound) upperBound = idx + 1;
+            printf("[New connection] FD: %d, idx: %d\n", newsockfd, idx);
           } else {
-            printf("Stack empty!");
+            printf("Stack empty!\n");
           }
         } else {
           printf("Negative newsockfd! %d\n", newsockfd);
         }
       } else {
         if (fds[i].revents > 0) {
-          printf("reading: %d\n", i);
+          printf("Incoming data! \n");
           fds[i].revents = 0;
-          ssize_t bufsize = read(fds[i].fd, buffer, BUFSIZE);
+          char *buffer = malloc(BUFSIZE);
+          size_t size = 0;
+          ssize_t rsize, capacity = BUFSIZE;
 
-          if (bufsize < 0) {
-            printf("%d %s\n", errno, strerror(errno));
-            handle_error(1, errno, "read");
+          while((rsize = read(fds[i].fd, buffer + size, capacity - size))) {
+            if (rsize < 0) {
+              printf("End of stream error! %d\n", rsize);
+              break;
+            }
+            size += rsize;
+            printf("Reading: %d\n", (int) rsize);
+
+            if (size == capacity) {
+              printf("Reallocating to capacity=%d\n", (int) (capacity * 2));
+              capacity *= 2;
+              buffer = realloc(buffer, (size_t) capacity);
+
+              if (buffer == NULL) {
+                printf("Failed to rellocate the buffer!\n");
+              }
+            }
           }
 
-          printf("Buffer: %s\n", buffer);
+          printf("Bytes read: %d, %d\n", (int) size, (int) rsize);
+          printf("Buffer: %s\n\n", buffer);
 
-          struct cache_entry *found_entry = NULL;
-          key = hash_buffer(buffer);
+          /* Target Response */
+          if (request_fds[fds[i].fd] > 0) {
+            printf("**** Target response\n");
+            int requester_fds = request_fds[fds[i].fd];
+            int data_source_fds = fds[i].fd;
+            request_fds[data_source_fds] = 0;
 
-          printf("Finding key: %llu\n", key);
-          HASH_FIND_INT(cache, &key, found_entry);
+            int ws = (int) write(requester_fds, buffer, strlen(buffer));
+            printf("write status: %d\n", ws);
+            close(data_source_fds);
+            close(requester_fds);
+            StackPush(&freeIndexesStack, i);
+          }
+          /* Cachr Request */
+          else {
+            printf("$$$ Cachr request\n");
+            struct cache_entry *found_entry = NULL;
+            key = hash_buffer(buffer);
 
-          if (found_entry) {
-            printf("Serving response from cache\n");
-
-            ssize_t sent_bytes = write(fds[i].fd, found_entry->buffer, found_entry->bytes);
-            if (sent_bytes > 0) {
-              printf("%d bytes sent to requester\n", (int) sent_bytes);
+            HASH_FIND_INT(cache, &key, found_entry);
+            if (found_entry) {
+              serve_response_from_cache(found_entry, fds[i].fd, i);
             } else {
-              printf("Failed to respond to requester from cache... %d\n", (int) sent_bytes);
-            }
+              printf("Not found in cache! Making request to target\n");
 
-            close(fds[i].fd);
-            StackPush(&freeIndexesStack, (stackElementT) i);
-          } else {
-            printf("Not found in cache! Making request to target\n");
+              int idx = StackPop(&freeIndexesStack);
+              int sockfd = initialize_new_socket();
+//              make_socket_non_blocking(sockfd);
 
-            int idx = StackPop(&freeIndexesStack);
+              // TODO: Handle status
+              int ws = (int) write(sockfd, buffer, strlen(buffer));
+              printf("write status: %d\n", ws);
+              write(sockfd, CONNECTION_CLOSE_MSG, strlen(CONNECTION_CLOSE_MSG));
+              write(sockfd, cfg.target_host, strlen(cfg.target_host));
 
-            int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-            if (sockfd < 0) {
-              handle_error(sockfd, errno, "ERROR opening socket");
-            }
+              fds[idx].fd = sockfd;
+              fds[idx].events = POLLOUT & POLLIN;
+              fds[idx].revents = 1;
+              sck_cnt = upperBound;
 
-            printf("Connecting to %s:%d\n", cfg.target_host, cfg.target_port);
+              printf("fd: %d, idx: %d\n", fds[idx].fd, idx);
 
-            if (connect(sockfd, (struct sockaddr *) &target_serv_addr, sizeof(target_serv_addr)) < 0) {
-              handle_error(1, errno, "Error while connecting");
-            }
+              /* Add request to array of pending requests */
+              request_fds[sockfd] = fds[i].fd;
 
-            int n = (int) write(sockfd, buffer, strlen(buffer));
-            printf("Written to sock: %d\n", n);
-
-            fds[idx].fd = sockfd;
-            make_socket_non_blocking(sockfd);
-            fds[idx].events = POLLIN;
-            fds[idx].revents = 1;
-            sck_cnt = upperBound;
-
-            printf("fd: %d, idx: %d\n", fds[idx].fd, idx);
-
-            if (idx >= upperBound) {
-              upperBound = idx + 1;
-
-              printf("New upper bound: %d\n", upperBound);
+              if (idx >= upperBound)
+                upperBound = idx + 1;
             }
           }
+
+          free(buffer);
+        } else {
+          printf("Nothing to do with idx: %d, fds: %d, revents: %d\n", i, fds[i].fd, fds[i].revents);
         }
       }
     }
@@ -195,11 +238,10 @@ void run(int listen_sck_fd, configuration cfg) {
 int main(int argc, char **argv) {
   char *config_name;
 
-  if (argc >= 2) {
+  if (argc >= 2)
     config_name = strdup(argv[1]);
-  } else {
+  else
     config_name = "config.ini";
-  }
 
   if (ini_parse(config_name, config_handler, &cfg) < 0) {
     handle_error(1, EACCES, "Can't load config");
