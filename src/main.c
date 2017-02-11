@@ -46,8 +46,9 @@ struct cache_entry {
 };
 
 struct socket_request_pair {
-  int key;
+  u_int64_t key;
   char* buffer;
+  struct UT_hash_handle hh;
 };
 
 int initialize_new_socket() {
@@ -66,12 +67,33 @@ int initialize_new_socket() {
 void serve_response_from_cache(struct cache_entry *found_entry, int fd, int i) {
   ssize_t sent_bytes = write(fd, found_entry->buffer, found_entry->bytes);
   if (sent_bytes > 0)
-    printf("%d bytes sent to requester\n", (int) sent_bytes);
+    printf("Cached response. %d bytes sent.\n", (int) sent_bytes);
   else
     printf("Failed to respond to requester from cache... %d\n", (int) sent_bytes);
 
   close(fd);
   StackPush(&freeIndexesStack, (stackElementT) i);
+}
+
+void find_pair_and_save_to_cache(int fd, char* buffer) {
+  struct socket_request_pair *pair = NULL;
+  HASH_FIND_INT(pairs, &fd, pair);
+
+  if (pair) {
+    u_int32_t bytes = sizeof(char) * strlen(buffer);
+
+    printf("Adding cache entry... \n");
+    struct cache_entry* entry = (struct cache_entry*) malloc(sizeof(struct cache_entry));
+    entry->key = hash_buffer(pair->buffer);
+    entry->timestamp = get_timestamp();
+    entry->buffer = malloc(bytes);
+    entry->bytes = bytes;
+    strcpy(entry->buffer, buffer);
+
+    HASH_ADD_INT(cache, key, entry);
+  } else {
+    printf("socket-request pair not found for key = %d!\n", fd);
+  }
 }
 
 void run(int listen_sck_fd, configuration cfg) {
@@ -95,6 +117,7 @@ void run(int listen_sck_fd, configuration cfg) {
   for (i = cfg.fds_count - 1; i > 0; i--)
     StackPush(&freeIndexesStack, (stackElementT) (i));
 
+  /* Get sockaddr_in structure only once as it's unlikely to change */
   target_serv_addr = get_server_addr(cfg);
   if (target_serv_addr.sin_addr.s_addr == NULL) {
     handle_error(1, errno, "Failed to create sockaddr_in structure");
@@ -129,22 +152,20 @@ void run(int listen_sck_fd, configuration cfg) {
           size_t size = 0;
           ssize_t rsize = 0, capacity = BUFSIZE;
 
-          printf("reading...\n");
-
           while ((rsize = read(fds[i].fd, buffer + size, capacity - size)) != -1 && rsize != 0) {
             if (rsize == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
               return;
             }
 
             if (rsize < 0) {
-              printf("End of stream error! %d\n", rsize);
               break;
             }
+
             size += rsize;
             printf("Reading: %d\n", (int) rsize);
 
             if (size == capacity) {
-              printf("Reallocating to capacity=%d\n", (int) (capacity * 2));
+              printf("Reallocating buffer to capacity=%d\n", (int) (capacity * 2));
               capacity *= 2;
               buffer = realloc(buffer, (size_t) capacity);
 
@@ -154,8 +175,9 @@ void run(int listen_sck_fd, configuration cfg) {
             }
           }
 
+          /* Because something was read we can mark job as done */
+          /* Otherwise socket returned -1 because it was not ready or error occured */
           if (size > 0) {
-            printf("Marking %d as done...\n", fds[i].fd);
             fds[i].revents = 0;
           } else {
             break;
@@ -166,13 +188,23 @@ void run(int listen_sck_fd, configuration cfg) {
           /* If entry is present in request_fds array then it's response from target
            * Otherwise it's request directly to cachr */
           if (request_fds[fds[i].fd] > 0) {
+            /* Find requester responsible for that request */
             int requester_fds = request_fds[fds[i].fd];
             int data_source_fds = fds[i].fd;
-            request_fds[data_source_fds] = 0;
+
+            /* Put response from target to cache */
+            find_pair_and_save_to_cache(fds[i].fd, buffer);
 
             //TODO: Handle status
+            /* Write non-cached response from target to requester */
             int ws = (int) write(requester_fds, buffer, strlen(buffer));
 
+            printf("Non-cached response. %d bytes sent.\n", ws);
+
+            /* Mark index "data_source_fds" as free */
+            request_fds[data_source_fds] = 0;
+
+            /* Close sockets, release idex */
             close(data_source_fds);
             close(requester_fds);
             StackPush(&freeIndexesStack, i);
@@ -184,22 +216,27 @@ void run(int listen_sck_fd, configuration cfg) {
             if (found_entry && found_entry->timestamp + cfg.ttl > get_timestamp()) {
               serve_response_from_cache(found_entry, fds[i].fd, i);
             } else {
-              /* Remove too old entry from cache */
+              /* Cached response was found but it was too old */
               if (found_entry) {
+                printf("Cache entry expired! %d < %d\n", (int) (found_entry->timestamp + cfg.ttl),
+                       (int) get_timestamp());
                 HASH_DEL(cache, found_entry);
               }
 
+              /* Perform request to the target */
+              /* Find suitable index in fds array */
               int idx = StackPop(&freeIndexesStack);
+              /* Create new socket */
               int sockfd = initialize_new_socket();
 
               //TODO: Handle status
+              /* Write request payload to that socket */
               int ws = (int) write(sockfd, buffer, strlen(buffer));
 
               /* Close connection immediately (Connection: close instead of keep-alive) */
               write(sockfd, CONNECTION_CLOSE_MSG, strlen(CONNECTION_CLOSE_MSG));
 
-//              write(sockfd, cfg.target_host, strlen(cfg.target_host));
-
+              /* Put that socket to fds array so we could "poll" it */
               fds[idx].fd = sockfd;
               fds[idx].events = POLLIN;
               fds[idx].revents = 1;
@@ -208,10 +245,16 @@ void run(int listen_sck_fd, configuration cfg) {
               /* Add request to array of pending requests */
               request_fds[sockfd] = fds[i].fd;
 
-              /* Add request to dictionary of pending to add to cache */
-              key = hash_buffer(buffer);
-              HASH_ADD_INT(pairs, key, )
+              /* Add request to dictionary of pending requests */
+              printf("Adding entry, buffer: \n%s\n", buffer);
+              struct socket_request_pair* entry =
+                  (struct socket_request_pair*) malloc(sizeof(struct socket_request_pair));
+              entry->key = (u_int64_t) sockfd;
+              entry->buffer = malloc(sizeof(char) * strlen(buffer));
+              strcpy(entry->buffer, buffer);
+              HASH_ADD_INT(pairs, key, entry);
 
+              /* If number of simultaneous requests is bigger than before we have to iterate to bigger index */
               if (idx >= upperBound)
                 upperBound = idx + 1;
             }

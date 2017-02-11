@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include "configutils.h"
 
+/* Ini -> Struct parser */
 int config_handler(void *user, const char *section, const char *name, const char *value) {
   configuration *pconfig = (configuration *) user;
 
