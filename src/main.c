@@ -48,6 +48,7 @@ struct cache_entry {
 struct socket_request_pair {
   u_int64_t key;
   char* buffer;
+  int idx;
   struct UT_hash_handle hh;
 };
 
@@ -65,6 +66,7 @@ int initialize_new_socket() {
 }
 
 void serve_response_from_cache(struct cache_entry *found_entry, int fd, int i) {
+  printf("Serving response from cache (%d bytes) to fd: %d\n", found_entry->bytes, fd);
   ssize_t sent_bytes = write(fd, found_entry->buffer, found_entry->bytes);
   if (sent_bytes > 0)
     printf("Cached response. %d bytes sent.\n", (int) sent_bytes);
@@ -82,7 +84,7 @@ void find_pair_and_save_to_cache(int fd, char* buffer) {
   if (pair) {
     u_int32_t bytes = sizeof(char) * strlen(buffer);
 
-    printf("Adding cache entry... \n");
+    printf("Adding cache entry \n");
     struct cache_entry* entry = (struct cache_entry*) malloc(sizeof(struct cache_entry));
     entry->key = hash_buffer(pair->buffer);
     entry->timestamp = get_timestamp();
@@ -91,6 +93,7 @@ void find_pair_and_save_to_cache(int fd, char* buffer) {
     strcpy(entry->buffer, buffer);
 
     HASH_ADD_INT(cache, key, entry);
+    StackPush(&freeIndexesStack, (stackElementT) pair->idx);
   } else {
     printf("socket-request pair not found for key = %d!\n", fd);
   }
@@ -119,7 +122,7 @@ void run(int listen_sck_fd, configuration cfg) {
 
   /* Get sockaddr_in structure only once as it's unlikely to change */
   target_serv_addr = get_server_addr(cfg);
-  if (target_serv_addr.sin_addr.s_addr == NULL) {
+  if (target_serv_addr.sin_addr.s_addr == 0) {
     handle_error(1, errno, "Failed to create sockaddr_in structure");
     exit(EXIT_FAILURE);
   }
@@ -141,12 +144,19 @@ void run(int listen_sck_fd, configuration cfg) {
             printf("[New connection] FD: %d, idx: %d\n", newsockfd, idx);
           } else {
             printf("Stack empty!\n");
+            exit(EXIT_FAILURE);
           }
-        } else {
-          printf("Negative newsockfd! %d\n", newsockfd);
         }
       } else {
-        if (fds[i].revents == POLLIN) {
+        if (fds[i].revents & POLLHUP) {
+          printf("Fd: %d was disconnected.\n", fds[i].fd);
+          StackPush(&freeIndexesStack, i);
+        } else if (fds[i].revents & POLLNVAL) {
+          printf("Fd: %d, id: %d invalid.\n", fds[i].fd, i);
+        } else if (fds[i].revents & POLLERR) {
+          printf("Fd: %d is broken.\n", fds[i].fd);
+          StackPush(&freeIndexesStack, i);
+        } else if (fds[i].revents & POLLIN) {
           char *buffer = malloc(BUFSIZE);
           buffer = memset(buffer, 0, BUFSIZE);
           size_t size = 0;
@@ -162,15 +172,18 @@ void run(int listen_sck_fd, configuration cfg) {
             }
 
             size += rsize;
-            printf("Reading: %d\n", (int) rsize);
+
+            /* Each dot informs about chunk of data, just for debugging purposes */
+            printf(".");
 
             if (size == capacity) {
-              printf("Reallocating buffer to capacity=%d\n", (int) (capacity * 2));
+              printf("Reallocating buffer to capacity: %d\n", (int) (capacity * 2));
               capacity *= 2;
               buffer = realloc(buffer, (size_t) capacity);
 
               if (buffer == NULL) {
                 printf("Failed to rellocate the buffer!\n");
+                exit(EXIT_FAILURE);
               }
             }
           }
@@ -183,7 +196,7 @@ void run(int listen_sck_fd, configuration cfg) {
             break;
           }
 
-          printf("Bytes read: %d, %d\n", (int) size, (int) rsize);
+          printf("\nidx: %d, fd: %d, bytes read: %d\n", i, fds[i].fd, (int) size);
 
           /* If entry is present in request_fds array then it's response from target
            * Otherwise it's request directly to cachr */
@@ -195,9 +208,11 @@ void run(int listen_sck_fd, configuration cfg) {
             /* Put response from target to cache */
             find_pair_and_save_to_cache(fds[i].fd, buffer);
 
-            //TODO: Handle status
             /* Write non-cached response from target to requester */
             int ws = (int) write(requester_fds, buffer, strlen(buffer));
+            if (ws < -1) {
+              perror("Failed to send response to requester\n");
+            }
 
             printf("Non-cached response. %d bytes sent.\n", ws);
 
@@ -208,6 +223,7 @@ void run(int listen_sck_fd, configuration cfg) {
             close(data_source_fds);
             close(requester_fds);
             StackPush(&freeIndexesStack, i);
+            printf("Closed socket %d & %d\n", data_source_fds, requester_fds);
           } else {
             struct cache_entry *found_entry = NULL;
             key = hash_buffer(buffer);
@@ -228,13 +244,16 @@ void run(int listen_sck_fd, configuration cfg) {
               int idx = StackPop(&freeIndexesStack);
               /* Create new socket */
               int sockfd = initialize_new_socket();
+              printf("New socket: %d (requesting data from target)\n", sockfd);
 
-              //TODO: Handle status
               /* Write request payload to that socket */
               int ws = (int) write(sockfd, buffer, strlen(buffer));
 
               /* Close connection immediately (Connection: close instead of keep-alive) */
               write(sockfd, CONNECTION_CLOSE_MSG, strlen(CONNECTION_CLOSE_MSG));
+              if (ws < -1) {
+                perror("Failed to send payload to target\n");
+              }
 
               /* Put that socket to fds array so we could "poll" it */
               fds[idx].fd = sockfd;
@@ -251,6 +270,7 @@ void run(int listen_sck_fd, configuration cfg) {
                   (struct socket_request_pair*) malloc(sizeof(struct socket_request_pair));
               entry->key = (u_int64_t) sockfd;
               entry->buffer = malloc(sizeof(char) * strlen(buffer));
+              entry->idx = idx;
               strcpy(entry->buffer, buffer);
               HASH_ADD_INT(pairs, key, entry);
 
