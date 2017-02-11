@@ -78,11 +78,14 @@ void run(int listen_sck_fd, configuration cfg) {
   int upperBound = 1;
   u_int64_t key;
   socklen_t clilen;
+
   struct sockaddr_in cli_addr;
   struct pollfd *fds = (struct pollfd *) calloc(cfg.fds_count, sizeof(struct pollfd));
+
   int request_fds[cfg.fds_count];
   for(int j = 0; j < cfg.fds_count; j++) request_fds[j] = 0;
 
+  /* Initialize stack of free indexes in fds array */
   StackInit(&freeIndexesStack, cfg.fds_count);
 
   fds[0].fd = listen_sck_fd;
@@ -91,8 +94,6 @@ void run(int listen_sck_fd, configuration cfg) {
   int i = 0;
   for (i = cfg.fds_count - 1; i > 0; i--)
     StackPush(&freeIndexesStack, (stackElementT) (i));
-
-  printf("Server started. Maximum concurrent connections: %d\n", cfg.fds_count);
 
   target_serv_addr = get_server_addr(cfg);
   if (target_serv_addr.sin_addr.s_addr == NULL) {
@@ -122,109 +123,101 @@ void run(int listen_sck_fd, configuration cfg) {
           printf("Negative newsockfd! %d\n", newsockfd);
         }
       } else {
-        printf("FD: %d - ", fds[i].fd);
-        switch (fds[i].revents) {
-          case POLLHUP:
-            printf("POLLHUP\n");
-            break;
-          case POLL_ERR:
-            printf("POLL_ERR!\n");
-            break;
-          case POLLNVAL:
-            printf("POLLNVAL\n");
-            break;
-          case POLLIN:
-            char *buffer = malloc(BUFSIZE);
-            buffer = memset(buffer, 0, BUFSIZE);
-            size_t size = 0;
-            ssize_t rsize = 0, capacity = BUFSIZE;
+        if (fds[i].revents == POLLIN) {
+          char *buffer = malloc(BUFSIZE);
+          buffer = memset(buffer, 0, BUFSIZE);
+          size_t size = 0;
+          ssize_t rsize = 0, capacity = BUFSIZE;
 
-            printf("reading...\n");
+          printf("reading...\n");
 
-            while ((rsize = read(fds[i].fd, buffer + size, capacity - size)) != -1 && rsize != 0) {
-              if (rsize == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                return;
-              }
-
-              if (rsize < 0) {
-                printf("End of stream error! %d\n", rsize);
-                break;
-              }
-              size += rsize;
-              printf("Reading: %d\n", (int) rsize);
-
-              if (size == capacity) {
-                printf("Reallocating to capacity=%d\n", (int) (capacity * 2));
-                capacity *= 2;
-                buffer = realloc(buffer, (size_t) capacity);
-
-                if (buffer == NULL) {
-                  printf("Failed to rellocate the buffer!\n");
-                }
-              }
+          while ((rsize = read(fds[i].fd, buffer + size, capacity - size)) != -1 && rsize != 0) {
+            if (rsize == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+              return;
             }
 
-            if (size > 0) {
-              printf("Marking %d as done...\n", fds[i].fd);
-              fds[i].revents = 0;
-            } else {
+            if (rsize < 0) {
+              printf("End of stream error! %d\n", rsize);
               break;
             }
+            size += rsize;
+            printf("Reading: %d\n", (int) rsize);
 
-            printf("Bytes read: %d, %d\n", (int) size, (int) rsize);
+            if (size == capacity) {
+              printf("Reallocating to capacity=%d\n", (int) (capacity * 2));
+              capacity *= 2;
+              buffer = realloc(buffer, (size_t) capacity);
 
-            /* Target Response */
-            if (request_fds[fds[i].fd] > 0) {
-              int requester_fds = request_fds[fds[i].fd];
-              int data_source_fds = fds[i].fd;
-              request_fds[data_source_fds] = 0;
-
-              int ws = (int) write(requester_fds, buffer, strlen(buffer));
-              printf("write status: %d\n", ws);
-              close(data_source_fds);
-              close(requester_fds);
-              StackPush(&freeIndexesStack, i);
-            }
-              /* Cachr Request */
-            else {
-              struct cache_entry *found_entry = NULL;
-              key = hash_buffer(buffer);
-
-              HASH_FIND_INT(cache, &key, found_entry);
-              if (found_entry && found_entry->timestamp + cfg.ttl > get_timestamp()) {
-                serve_response_from_cache(found_entry, fds[i].fd, i);
-              } else {
-                printf("Not found in cache! Making request to target\n");
-                if (found_entry) {
-                  HASH_DEL(cache, found_entry);
-                }
-
-                int idx = StackPop(&freeIndexesStack);
-                int sockfd = initialize_new_socket();
-
-                int ws = (int) write(sockfd, buffer, strlen(buffer));
-                printf("write status: %d\n", ws);
-                write(sockfd, CONNECTION_CLOSE_MSG, strlen(CONNECTION_CLOSE_MSG));
-                write(sockfd, cfg.target_host, strlen(cfg.target_host));
-
-                fds[idx].fd = sockfd;
-                fds[idx].events = POLLIN;
-                fds[idx].revents = 1;
-                sck_cnt = upperBound;
-
-                printf("fd: %d, idx: %d\n", fds[idx].fd, idx);
-
-                /* Add request to array of pending requests */
-                request_fds[sockfd] = fds[i].fd;
-
-                if (idx >= upperBound)
-                  upperBound = idx + 1;
+              if (buffer == NULL) {
+                printf("Failed to rellocate the buffer!\n");
               }
             }
+          }
 
-            free(buffer);
-          default:
-            printf("default case revents\n");
+          if (size > 0) {
+            printf("Marking %d as done...\n", fds[i].fd);
+            fds[i].revents = 0;
+          } else {
+            break;
+          }
+
+          printf("Bytes read: %d, %d\n", (int) size, (int) rsize);
+
+          /* If entry is present in request_fds array then it's response from target
+           * Otherwise it's request directly to cachr */
+          if (request_fds[fds[i].fd] > 0) {
+            int requester_fds = request_fds[fds[i].fd];
+            int data_source_fds = fds[i].fd;
+            request_fds[data_source_fds] = 0;
+
+            //TODO: Handle status
+            int ws = (int) write(requester_fds, buffer, strlen(buffer));
+
+            close(data_source_fds);
+            close(requester_fds);
+            StackPush(&freeIndexesStack, i);
+          } else {
+            struct cache_entry *found_entry = NULL;
+            key = hash_buffer(buffer);
+
+            HASH_FIND_INT(cache, &key, found_entry);
+            if (found_entry && found_entry->timestamp + cfg.ttl > get_timestamp()) {
+              serve_response_from_cache(found_entry, fds[i].fd, i);
+            } else {
+              /* Remove too old entry from cache */
+              if (found_entry) {
+                HASH_DEL(cache, found_entry);
+              }
+
+              int idx = StackPop(&freeIndexesStack);
+              int sockfd = initialize_new_socket();
+
+              //TODO: Handle status
+              int ws = (int) write(sockfd, buffer, strlen(buffer));
+
+              /* Close connection immediately (Connection: close instead of keep-alive) */
+              write(sockfd, CONNECTION_CLOSE_MSG, strlen(CONNECTION_CLOSE_MSG));
+
+//              write(sockfd, cfg.target_host, strlen(cfg.target_host));
+
+              fds[idx].fd = sockfd;
+              fds[idx].events = POLLIN;
+              fds[idx].revents = 1;
+              sck_cnt = upperBound;
+
+              /* Add request to array of pending requests */
+              request_fds[sockfd] = fds[i].fd;
+
+              /* Add request to dictionary of pending to add to cache */
+              key = hash_buffer(buffer);
+              HASH_ADD_INT(pairs, key, )
+
+              if (idx >= upperBound)
+                upperBound = idx + 1;
+            }
+          }
+
+          free(buffer);
         }
       }
     }
