@@ -45,7 +45,11 @@ int prepare_in_sock(configuration cfg) {
       }
 
       freeaddrinfo(result);
-      make_socket_non_blocking(sfd);
+      int blocking_status = make_socket_non_blocking(sfd);
+      if (blocking_status == -1) {
+        close(sfd);
+        return -1;
+      }
       return sfd;
     }
     close(sfd);

@@ -29,7 +29,7 @@ struct cache_entry *cache = NULL;
 struct socket_request_pair *pairs = NULL;
 
 /* Number of sockets connected in fds array */
-int sck_cnt = 100;
+int sck_cnt = 1;
 
 /* Stack of available indexes in fds array */
 stackT freeIndexesStack;
@@ -136,15 +136,21 @@ void run(int listen_sck_fd, configuration cfg) {
         if (newsockfd > 0) {
           if (!StackIsEmpty(&freeIndexesStack)) {
             int idx = StackPop(&freeIndexesStack);
-            fds[idx].fd = newsockfd;
-            fds[idx].events = POLLIN | POLLPRI;
-            make_socket_non_blocking(newsockfd);
+            int blocking_status = make_socket_non_blocking(newsockfd);
+            if (blocking_status == -1) {
+              break;
+            }
 
+            fds[idx].fd = newsockfd;
+            fds[idx].events = POLLIN;
             if (idx >= upperBound) upperBound = idx + 1;
+            sck_cnt = upperBound;
+
             printf("[New connection] FD: %d, idx: %d\n", newsockfd, idx);
           } else {
+            /* We reached the maximum amount of concurrent connections, ignore this connection */
             printf("Stack empty!\n");
-            exit(EXIT_FAILURE);
+            close(newsockfd);
           }
         }
       } else {
@@ -162,9 +168,9 @@ void run(int listen_sck_fd, configuration cfg) {
           size_t size = 0;
           ssize_t rsize = 0, capacity = BUFSIZE;
 
-          while ((rsize = read(fds[i].fd, buffer + size, capacity - size)) != -1 && rsize != 0) {
+          while ((rsize = read(fds[i].fd, buffer + size, capacity - size))) {
             if (rsize == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-              return;
+              break;
             }
 
             if (rsize < 0) {
@@ -259,7 +265,6 @@ void run(int listen_sck_fd, configuration cfg) {
               fds[idx].fd = sockfd;
               fds[idx].events = POLLIN;
               fds[idx].revents = 1;
-              sck_cnt = upperBound;
 
               /* Add request to array of pending requests */
               request_fds[sockfd] = fds[i].fd;
@@ -277,6 +282,8 @@ void run(int listen_sck_fd, configuration cfg) {
               /* If number of simultaneous requests is bigger than before we have to iterate to bigger index */
               if (idx >= upperBound)
                 upperBound = idx + 1;
+
+              sck_cnt = upperBound;
             }
           }
 
@@ -290,8 +297,10 @@ void run(int listen_sck_fd, configuration cfg) {
 int main(int argc, char **argv) {
   char *config_name;
 
-  if (argc >= 2)
-    config_name = strdup(argv[1]);
+  if (argc >= 2) {
+    config_name = malloc(sizeof(char) * strlen(argv[1]));
+    strcpy(config_name, argv[1]);
+  }
   else
     config_name = "config.ini";
 

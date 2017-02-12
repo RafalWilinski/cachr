@@ -1,4 +1,5 @@
 #include <sys/time.h>
+/* u_int64_t */
 #include <ntsid.h>
 #include "utils.h"
 
