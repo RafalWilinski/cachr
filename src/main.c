@@ -12,6 +12,7 @@
 #include "configutils.h"
 #include "netutils.h"
 #include "utils.h"
+#include "libs/picohttpparser.h"
 
 /* Size of buffer/chunk read */
 #define BUFSIZE 4096
@@ -49,6 +50,15 @@ struct socket_request_pair {
   u_int64_t key;
   char* buffer;
   int idx;
+  int ttl;
+  struct UT_hash_handle hh;
+};
+
+struct buffer_data {
+  u_int64_t key;
+  int bytes_read;
+  int allocated_mem;
+  char* buffer;
   struct UT_hash_handle hh;
 };
 
@@ -64,6 +74,10 @@ int initialize_new_socket() {
 
   return sockfd;
 }
+
+int get_ttl_value(char *header_value) {
+
+};
 
 void serve_response_from_cache(struct cache_entry *found_entry, int fd, int i) {
   printf("Serving response from cache (%d bytes) to fd: %d\n", found_entry->bytes, fd);
@@ -84,15 +98,18 @@ void find_pair_and_save_to_cache(int fd, char* buffer) {
   if (pair) {
     u_int32_t bytes = sizeof(char) * strlen(buffer);
 
-    printf("Adding cache entry \n");
-    struct cache_entry* entry = (struct cache_entry*) malloc(sizeof(struct cache_entry));
-    entry->key = hash_buffer(pair->buffer);
-    entry->timestamp = get_timestamp();
-    entry->buffer = malloc(bytes);
-    entry->bytes = bytes;
-    strcpy(entry->buffer, buffer);
+    if (pair->ttl > 0) {
+      printf("Adding cache entry \n");
+      struct cache_entry *entry = (struct cache_entry *) malloc(sizeof(struct cache_entry));
+      entry->key = hash_buffer(pair->buffer);
+      entry->timestamp = get_timestamp() + pair->ttl;
+      entry->buffer = malloc(bytes);
+      entry->bytes = bytes;
+      strcpy(entry->buffer, buffer);
 
-    HASH_ADD_INT(cache, key, entry);
+      HASH_ADD_INT(cache, key, entry);
+    }
+
     StackPush(&freeIndexesStack, (stackElementT) pair->idx);
   } else {
     printf("socket-request pair not found for key = %d!\n", fd);
@@ -163,24 +180,29 @@ void run(int listen_sck_fd, configuration cfg) {
           printf("Fd: %d is broken.\n", fds[i].fd);
           StackPush(&freeIndexesStack, i);
         } else if (fds[i].revents & POLLIN) {
+
           char *buffer = malloc(BUFSIZE);
           buffer = memset(buffer, 0, BUFSIZE);
           size_t size = 0;
           ssize_t rsize = 0, capacity = BUFSIZE;
 
           while ((rsize = read(fds[i].fd, buffer + size, capacity - size))) {
+            /* Reading should be continued later */
             if (rsize == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+              printf("would block\n");
               break;
             }
 
-            if (rsize < 0) {
+            /* Finished reading */
+            if (rsize == 0) {
               break;
             }
 
+            /* Else (positive number of bytes) */
             size += rsize;
 
             /* Each dot informs about chunk of data, just for debugging purposes */
-            printf(".");
+            printf("Rsize: %d\n", rsize);
 
             if (size == capacity) {
               printf("Reallocating buffer to capacity: %d\n", (int) (capacity * 2));
@@ -194,9 +216,9 @@ void run(int listen_sck_fd, configuration cfg) {
             }
           }
 
-          /* Because something was read we can mark job as done */
+          /* If zero or greater than zero bytes read = EOF */
           /* Otherwise socket returned -1 because it was not ready or error occured */
-          if (size > 0) {
+          if (rsize >= 0) {
             fds[i].revents = 0;
           } else {
             break;
@@ -204,7 +226,7 @@ void run(int listen_sck_fd, configuration cfg) {
 
           printf("\nidx: %d, fd: %d, bytes read: %d\n", i, fds[i].fd, (int) size);
 
-          /* If entry is present in request_fds array then it's response from target
+          /* If entry is present in request_fds array then it's response from target.
            * Otherwise it's request directly to cachr */
           if (request_fds[fds[i].fd] > 0) {
             /* Find requester responsible for that request */
@@ -225,22 +247,46 @@ void run(int listen_sck_fd, configuration cfg) {
             /* Mark index "data_source_fds" as free */
             request_fds[data_source_fds] = 0;
 
-            /* Close sockets, release idex */
+            /* Close sockets, release index */
             close(data_source_fds);
             close(requester_fds);
             StackPush(&freeIndexesStack, i);
             printf("Closed socket %d & %d\n", data_source_fds, requester_fds);
           } else {
             struct cache_entry *found_entry = NULL;
+            int ttl = cfg.ttl;
+            char *method, *path;
+            size_t method_len, path_len, num_headers;
+            int minor_version, pret;
+            struct phr_header headers[100];
+
+            pret = phr_parse_request(buffer, size, &method, &method_len, &path, &path_len,
+                                     &minor_version, headers, &num_headers, 0);
+            /* Parsed successfully */
+            if (pret > 0) {
+              /* Find header called "TTL" and parse it's value to integer */
+              for (i = 0; i != num_headers; ++i) {
+                if (headers[i].name == "Cache-Control") {
+                  if (headers[i].value == "no-cache" || headers[i].value == "no-store") ttl = 0;
+                  else {
+                    /* Parse "max-age=X" */
+                    int ttl = get_ttl_value(headers[i].value);
+                  }
+
+                  break;
+                }
+              }
+            }
+
             key = hash_buffer(buffer);
 
             HASH_FIND_INT(cache, &key, found_entry);
-            if (found_entry && found_entry->timestamp + cfg.ttl > get_timestamp()) {
+            if (found_entry && found_entry->timestamp > get_timestamp()) {
               serve_response_from_cache(found_entry, fds[i].fd, i);
             } else {
               /* Cached response was found but it was too old */
               if (found_entry) {
-                printf("Cache entry expired! %d < %d\n", (int) (found_entry->timestamp + cfg.ttl),
+                printf("Cache entry expired! %d < %d\n", (int) found_entry->timestamp,
                        (int) get_timestamp());
                 HASH_DEL(cache, found_entry);
               }
@@ -248,6 +294,7 @@ void run(int listen_sck_fd, configuration cfg) {
               /* Perform request to the target */
               /* Find suitable index in fds array */
               int idx = StackPop(&freeIndexesStack);
+
               /* Create new socket */
               int sockfd = initialize_new_socket();
               printf("New socket: %d (requesting data from target)\n", sockfd);
@@ -270,12 +317,13 @@ void run(int listen_sck_fd, configuration cfg) {
               request_fds[sockfd] = fds[i].fd;
 
               /* Add request to dictionary of pending requests */
-              printf("Adding entry, buffer: \n%s\n", buffer);
+              printf("Adding pending request, buffer: \n%s\n", buffer);
               struct socket_request_pair* entry =
                   (struct socket_request_pair*) malloc(sizeof(struct socket_request_pair));
               entry->key = (u_int64_t) sockfd;
               entry->buffer = malloc(sizeof(char) * strlen(buffer));
               entry->idx = idx;
+              entry->ttl = ttl;
               strcpy(entry->buffer, buffer);
               HASH_ADD_INT(pairs, key, entry);
 
@@ -300,9 +348,9 @@ int main(int argc, char **argv) {
   if (argc >= 2) {
     config_name = malloc(sizeof(char) * strlen(argv[1]));
     strcpy(config_name, argv[1]);
-  }
-  else
+  } else {
     config_name = "config.ini";
+  }
 
   if (ini_parse(config_name, config_handler, &cfg) < 0) {
     handle_error(1, EACCES, "Can't load config");
