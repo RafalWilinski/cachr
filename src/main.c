@@ -76,7 +76,11 @@ int initialize_new_socket() {
 }
 
 int get_ttl_value(char *header_value) {
-
+  char *separator = "=";
+  char *b = strtok(header_value, separator);
+  char *c = strtok(NULL, "");
+  printf("c: %s\n", c);
+  return atoi(c);
 };
 
 void serve_response_from_cache(struct cache_entry *found_entry, int fd, int i) {
@@ -268,9 +272,9 @@ void run(int listen_sck_fd, configuration cfg) {
               for (i = 0; i != num_headers; ++i) {
                 if (headers[i].name == "Cache-Control") {
                   if (headers[i].value == "no-cache" || headers[i].value == "no-store") ttl = 0;
-                  else {
+                  else if (headers[i].value == "max-age") {
                     /* Parse "max-age=X" */
-                    int ttl = get_ttl_value(headers[i].value);
+                    ttl = get_ttl_value((char *) headers[i].value);
                   }
 
                   break;
