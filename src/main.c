@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 
 #include "libs/ini.h"
 #include "error.h"
@@ -54,14 +55,6 @@ struct socket_request_pair {
   struct UT_hash_handle hh;
 };
 
-struct buffer_data {
-  u_int64_t key;
-  int bytes_read;
-  int allocated_mem;
-  char* buffer;
-  struct UT_hash_handle hh;
-};
-
 int initialize_new_socket() {
   int sockfd = socket(AF_INET, SOCK_STREAM, 0);
   if (sockfd < 0)
@@ -95,34 +88,245 @@ void serve_response_from_cache(struct cache_entry *found_entry, int fd, int i) {
   StackPush(&freeIndexesStack, (stackElementT) i);
 }
 
-void find_pair_and_save_to_cache(int fd, char* buffer) {
-  struct socket_request_pair *pair = NULL;
-  HASH_FIND_INT(pairs, &fd, pair);
+struct connection_info {
+  int sck;
+};
 
-  if (pair) {
-    u_int32_t bytes = sizeof(char) * strlen(buffer);
+/*
+ * Statuses:
+ * -1: Receiving data from requester
+ *  1: Sending data to target
+ *  2: Receiving data from target
+ *  3: Sending back data to requester
+ */
+void* handle_tcp_connection(void *ctx) {
+  struct connection_info *conn_info = ctx;
+  int read_timeout = -1, write_timeout = -1, status = -1;
+  u_int64_t key;
+  struct cache_entry *found_entry = NULL;
+  char *buffer = malloc(BUFSIZE);
+  buffer = memset(buffer, 0, BUFSIZE);
 
-    if (pair->ttl > 0) {
-      printf("Adding cache entry \n");
-      struct cache_entry *entry = (struct cache_entry *) malloc(sizeof(struct cache_entry));
-      entry->key = hash_buffer(pair->buffer);
-      entry->timestamp = get_timestamp() + pair->ttl;
-      entry->buffer = malloc(bytes);
-      entry->bytes = bytes;
-      strcpy(entry->buffer, buffer);
+  struct pollfd *fds = (struct pollfd *) calloc(1, sizeof(struct pollfd));
+  fds[0].fd = conn_info->sck;
+  fds[0].events = POLLIN;
 
-      HASH_ADD_INT(cache, key, entry);
+  while (poll(fds, (nfds_t) 1, read_timeout) && (status != 0)) {
+    if (fds[0].revents & POLLHUP) {
+      printf("Fd: %d was disconnected.\n", conn_info->sck);
+    } else if (fds[0].revents & POLLNVAL) {
+      printf("Fd: %d is invalid.\n", conn_info->sck);
+    } else if (fds[0].revents & POLLERR) {
+      printf("Fd: %d is broken.\n", conn_info->sck);
+    } else if (fds[0].revents & POLLIN && status == -1) {
+      printf("POLLIN - %d\n", conn_info->sck);
+      fds[0].revents = 0;
+      size_t size = 0;
+      ssize_t rsize = 0, capacity = BUFSIZE;
+
+      while ((rsize = read(fds[0].fd, buffer + size, capacity - size))) {
+        /* Reading should be continued later or end of transmission */
+        if (rsize == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+          printf("would block\n");
+          break;
+        }
+
+        /* Else (positive number of bytes) */
+        size += rsize;
+
+        /* Each dot informs about chunk of data, just for debugging purposes */
+        printf("Receiving bytes: %d\n", rsize);
+
+        if (size == capacity) {
+          printf("Reallocating buffer to capacity: %d\n", (int) (capacity * 2));
+          capacity *= 2;
+          buffer = realloc(buffer, (size_t) capacity);
+
+          if (buffer == NULL) {
+            printf("Failed to rellocate the buffer!\n");
+            exit(EXIT_FAILURE);
+          }
+        }
+      }
+
+      int ttl = cfg.ttl, i;
+      char *method, *path;
+      size_t method_len, path_len, num_headers;
+      int minor_version, pret;
+      struct phr_header headers[100];
+      num_headers = sizeof(headers) / sizeof(headers[0]);
+
+      pret = phr_parse_request(buffer, strlen(buffer), &method, &method_len, &path, &path_len,
+                               &minor_version, headers, &num_headers, 0);
+
+      /* Request is incomplete */
+      if (pret == -2) break;
+      if (pret == -1) {
+        printf("Parse Error! rsize=%d, buffer:\n%s\n", (int) rsize, buffer);
+      }
+
+      status = 1;
+      printf("Request parsed!\n");
+
+      /* In request find header called "TTL" and parse it's value to integer */
+      for (i = 0; i != num_headers; ++i) {
+        if (headers[i].name == "Cache-Control") {
+          if (headers[i].value == "no-cache" || headers[i].value == "no-store") ttl = 0;
+          else if (headers[i].value == "max-age") {
+            /* Parse "max-age=X" */
+            ttl = get_ttl_value((char *) headers[i].value);
+          }
+
+          break;
+        }
+      }
+
+      key = hash_buffer(buffer);
+
+      HASH_FIND_INT(cache, &key, found_entry);
+      if (found_entry && found_entry->timestamp > get_timestamp()) {
+        serve_response_from_cache(found_entry, fds[i].fd, i);
+      } else {
+        int req_sockfd = initialize_new_socket();
+        ssize_t bytes_sent = 0, total_bytes_sent = 0;
+        printf("New socket: %d (sending request to target)\n", req_sockfd);
+
+        struct pollfd *req_fds = (struct pollfd *) calloc(1, sizeof(struct pollfd));
+        req_fds[0].fd = req_sockfd;
+        req_fds[0].events = POLLOUT;
+
+        while (poll(req_fds, (nfds_t) 1, write_timeout)) {
+          if (req_fds[0].revents & POLLOUT && status == 1) {
+            printf("POLLOUT2\n");
+            req_fds[0].revents = 0;
+
+            if (total_bytes_sent < strlen(buffer)) {
+              printf("Sending...\n");
+              while ((bytes_sent = write(req_sockfd, buffer + total_bytes_sent, strlen(buffer - total_bytes_sent)))) {
+                /* Writing should be continued later or end of transmission */
+                if (bytes_sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                  printf("Sending would block.\n");
+                  break;
+                }
+
+                total_bytes_sent += bytes_sent;
+
+                printf("%d / %d bytes sent. (%d in this tick)\n", (int) total_bytes_sent, (int) strlen(buffer),
+                       (int) bytes_sent);
+              }
+
+            } else {
+              printf("Whole request sent! %s\n", buffer);
+
+              write(req_sockfd, "Host: cs.put.poznan.pl", strlen("Host: cs.put.poznan.pl"));
+
+              req_fds[0].events = POLLIN;
+              free(buffer);
+              buffer = malloc(BUFSIZE);
+              size = 0;
+              capacity = BUFSIZE;
+              status = 2;
+            }
+          } if (req_fds[0].revents & POLLIN && status == 2) {
+            printf("POLLIN2\n");
+            req_fds[0].revents = 0;
+
+            while ((rsize = read(req_fds[0].fd, buffer + size, capacity - size))) {
+              /* Reading should be continued later or end of transmission */
+              if (rsize == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                printf("would block\n");
+                break;
+              }
+
+              /* Else (positive number of bytes) */
+              size += rsize;
+
+              /* Each dot informs about chunk of data, just for debugging purposes */
+              printf("Receiving bytes from target: %d\n", (int) rsize);
+
+              if (size == capacity) {
+                printf("Reallocating buffer to capacity: %d\n", (int) (capacity * 2));
+                capacity *= 2;
+                buffer = realloc(buffer, (size_t) capacity);
+
+                if (buffer == NULL) {
+                  printf("Failed to rellocate the buffer!\n");
+                  exit(EXIT_FAILURE);
+                }
+              }
+            }
+
+            int minor_version, status;
+            char *msg;
+            size_t msg_len;
+
+            num_headers = sizeof(headers) / sizeof(headers[0]);
+            pret = phr_parse_response(buffer, strlen(buffer), &minor_version, &status, &msg, &msg_len, headers, &num_headers, 0);
+            if (pret == -2) break;
+            if (pret == -1) {
+              printf("Response parse error! %s\n", buffer);
+            }
+
+            printf("Response parsed, Received buffer: %s\n", buffer);
+            close(req_fds[0].fd);
+            status = 3;
+            fds[0].events = POLLOUT;
+            printf("Closing sock=%d, status: %d\n", req_fds[0].fd, status);
+            break;
+
+            /*
+             * struct cache_entry *entry = (struct cache_entry *) malloc(sizeof(struct cache_entry));
+              entry->key = hash_buffer(pair->buffer);
+              entry->timestamp = get_timestamp() + pair->ttl;
+              entry->buffer = malloc(bytes);
+              entry->bytes = bytes;
+              strcpy(entry->buffer, buffer);
+
+              HASH_ADD_INT(cache, key, entry);
+             */
+          }
+        }
+      }
+    } else if (fds[0].revents & POLLOUT) {
+      printf("POLLOUT - %d, status=%d\n", conn_info->sck, status);
+      sleep(1);
+      if (status == 2) {
+        printf("napierdalam\n");
+        fds[0].revents = 0;
+        ssize_t bytes_sent = 0, total_bytes_sent = 0;
+
+        if (total_bytes_sent < strlen(buffer)) {
+          printf("Sending...\n");
+          while ((bytes_sent = write(fds[0].fd, buffer + total_bytes_sent, strlen(buffer - total_bytes_sent)))) {
+            /* Writing should be continued later or end of transmission */
+            if (bytes_sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+              printf("Sending would block.\n");
+              break;
+            }
+
+            total_bytes_sent += bytes_sent;
+
+            printf("%d / %d bytes sent. (%d in this tick)\n", (int) total_bytes_sent, (int) strlen(buffer),
+                   (int) bytes_sent);
+
+            if (total_bytes_sent == strlen(buffer)) {
+              close(fds[0].fd);
+              printf("End\n");
+              status = 0;
+              break;
+            }
+          }
+        }
+      }
     }
-
-    StackPush(&freeIndexesStack, (stackElementT) pair->idx);
-  } else {
-    printf("socket-request pair not found for key = %d!\n", fd);
   }
+
+  free(buffer);
+  printf("poll outer end, status: %d\n", status);
 }
 
 void run(int listen_sck_fd, configuration cfg) {
   int upperBound = 1;
-  u_int64_t key;
   socklen_t clilen;
 
   struct sockaddr_in cli_addr;
@@ -155,191 +359,15 @@ void run(int listen_sck_fd, configuration cfg) {
 
         int newsockfd = accept(listen_sck_fd, (struct sockaddr *) &cli_addr, &clilen);
         if (newsockfd > 0) {
-          if (!StackIsEmpty(&freeIndexesStack)) {
-            int idx = StackPop(&freeIndexesStack);
-            int blocking_status = make_socket_non_blocking(newsockfd);
-            if (blocking_status == -1) {
-              break;
-            }
+          pthread_t thid;
+          int rc;
+          struct connection_info conn_info;
+          conn_info.sck = newsockfd;
 
-            fds[idx].fd = newsockfd;
-            fds[idx].events = POLLIN;
-            if (idx >= upperBound) upperBound = idx + 1;
-            sck_cnt = upperBound;
-
-            printf("[New connection] FD: %d, idx: %d\n", newsockfd, idx);
-          } else {
-            /* We reached the maximum amount of concurrent connections, ignore this connection */
-            printf("Stack empty!\n");
-            close(newsockfd);
-          }
-        }
-      } else {
-        if (fds[i].revents & POLLHUP) {
-          printf("Fd: %d was disconnected.\n", fds[i].fd);
-          StackPush(&freeIndexesStack, i);
-        } else if (fds[i].revents & POLLNVAL) {
-          printf("Fd: %d, id: %d invalid.\n", fds[i].fd, i);
-        } else if (fds[i].revents & POLLERR) {
-          printf("Fd: %d is broken.\n", fds[i].fd);
-          StackPush(&freeIndexesStack, i);
-        } else if (fds[i].revents & POLLIN) {
-
-          char *buffer = malloc(BUFSIZE);
-          buffer = memset(buffer, 0, BUFSIZE);
-          size_t size = 0;
-          ssize_t rsize = 0, capacity = BUFSIZE;
-
-          while ((rsize = read(fds[i].fd, buffer + size, capacity - size))) {
-            /* Reading should be continued later */
-            if (rsize == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-              printf("would block\n");
-              break;
-            }
-
-            /* Finished reading */
-            if (rsize == 0) {
-              break;
-            }
-
-            /* Else (positive number of bytes) */
-            size += rsize;
-
-            /* Each dot informs about chunk of data, just for debugging purposes */
-            printf("Rsize: %d\n", rsize);
-
-            if (size == capacity) {
-              printf("Reallocating buffer to capacity: %d\n", (int) (capacity * 2));
-              capacity *= 2;
-              buffer = realloc(buffer, (size_t) capacity);
-
-              if (buffer == NULL) {
-                printf("Failed to rellocate the buffer!\n");
-                exit(EXIT_FAILURE);
-              }
-            }
-          }
-
-          /* If zero or greater than zero bytes read = EOF */
-          /* Otherwise socket returned -1 because it was not ready or error occured */
-          if (rsize >= 0) {
-            fds[i].revents = 0;
-          } else {
-            break;
-          }
-
-          printf("\nidx: %d, fd: %d, bytes read: %d\n", i, fds[i].fd, (int) size);
-
-          /* If entry is present in request_fds array then it's response from target.
-           * Otherwise it's request directly to cachr */
-          if (request_fds[fds[i].fd] > 0) {
-            /* Find requester responsible for that request */
-            int requester_fds = request_fds[fds[i].fd];
-            int data_source_fds = fds[i].fd;
-
-            /* Put response from target to cache */
-            find_pair_and_save_to_cache(fds[i].fd, buffer);
-
-            /* Write non-cached response from target to requester */
-            int ws = (int) write(requester_fds, buffer, strlen(buffer));
-            if (ws < -1) {
-              perror("Failed to send response to requester\n");
-            }
-
-            printf("Non-cached response. %d bytes sent.\n", ws);
-
-            /* Mark index "data_source_fds" as free */
-            request_fds[data_source_fds] = 0;
-
-            /* Close sockets, release index */
-            close(data_source_fds);
-            close(requester_fds);
-            StackPush(&freeIndexesStack, i);
-            printf("Closed socket %d & %d\n", data_source_fds, requester_fds);
-          } else {
-            struct cache_entry *found_entry = NULL;
-            int ttl = cfg.ttl;
-            char *method, *path;
-            size_t method_len, path_len, num_headers;
-            int minor_version, pret;
-            struct phr_header headers[100];
-
-            pret = phr_parse_request(buffer, size, &method, &method_len, &path, &path_len,
-                                     &minor_version, headers, &num_headers, 0);
-            /* Parsed successfully */
-            if (pret > 0) {
-              /* Find header called "TTL" and parse it's value to integer */
-              for (i = 0; i != num_headers; ++i) {
-                if (headers[i].name == "Cache-Control") {
-                  if (headers[i].value == "no-cache" || headers[i].value == "no-store") ttl = 0;
-                  else if (headers[i].value == "max-age") {
-                    /* Parse "max-age=X" */
-                    ttl = get_ttl_value((char *) headers[i].value);
-                  }
-
-                  break;
-                }
-              }
-            }
-
-            key = hash_buffer(buffer);
-
-            HASH_FIND_INT(cache, &key, found_entry);
-            if (found_entry && found_entry->timestamp > get_timestamp()) {
-              serve_response_from_cache(found_entry, fds[i].fd, i);
-            } else {
-              /* Cached response was found but it was too old */
-              if (found_entry) {
-                printf("Cache entry expired! %d < %d\n", (int) found_entry->timestamp,
-                       (int) get_timestamp());
-                HASH_DEL(cache, found_entry);
-              }
-
-              /* Perform request to the target */
-              /* Find suitable index in fds array */
-              int idx = StackPop(&freeIndexesStack);
-
-              /* Create new socket */
-              int sockfd = initialize_new_socket();
-              printf("New socket: %d (requesting data from target)\n", sockfd);
-
-              /* Write request payload to that socket */
-              int ws = (int) write(sockfd, buffer, strlen(buffer));
-
-              /* Close connection immediately (Connection: close instead of keep-alive) */
-              write(sockfd, CONNECTION_CLOSE_MSG, strlen(CONNECTION_CLOSE_MSG));
-              if (ws < -1) {
-                perror("Failed to send payload to target\n");
-              }
-
-              /* Put that socket to fds array so we could "poll" it */
-              fds[idx].fd = sockfd;
-              fds[idx].events = POLLIN;
-              fds[idx].revents = 1;
-
-              /* Add request to array of pending requests */
-              request_fds[sockfd] = fds[i].fd;
-
-              /* Add request to dictionary of pending requests */
-              printf("Adding pending request, buffer: \n%s\n", buffer);
-              struct socket_request_pair* entry =
-                  (struct socket_request_pair*) malloc(sizeof(struct socket_request_pair));
-              entry->key = (u_int64_t) sockfd;
-              entry->buffer = malloc(sizeof(char) * strlen(buffer));
-              entry->idx = idx;
-              entry->ttl = ttl;
-              strcpy(entry->buffer, buffer);
-              HASH_ADD_INT(pairs, key, entry);
-
-              /* If number of simultaneous requests is bigger than before we have to iterate to bigger index */
-              if (idx >= upperBound)
-                upperBound = idx + 1;
-
-              sck_cnt = upperBound;
-            }
-          }
-
-          free(buffer);
+          rc = pthread_create(&thid, NULL, handle_tcp_connection, &conn_info);
+          printf("Thread created. Rc: %d, Pid: %d, Sock: %d\n", rc, (int) thid, newsockfd);
+          rc = pthread_detach(thid);
+          printf("Thread detached. Rc: %d\n", rc);
         }
       }
     }
