@@ -101,7 +101,7 @@ struct connection_info {
  */
 void* handle_tcp_connection(void *ctx) {
   struct connection_info *conn_info = ctx;
-  int read_timeout = -1, write_timeout = -1, status = -1;
+  int read_timeout = -1, write_timeout = -1, status = -1, request_content_length = -1, response_content_length = -1;
   u_int64_t key;
   struct cache_entry *found_entry = NULL;
   char *buffer = malloc(BUFSIZE);
@@ -119,6 +119,7 @@ void* handle_tcp_connection(void *ctx) {
     } else if (fds[0].revents & POLLERR) {
       printf("Fd: %d is broken.\n", conn_info->sck);
     } else if (fds[0].revents & POLLIN && status == -1) {
+      /* Handle Incoming Request to proxy */
       printf("POLLIN - %d\n", conn_info->sck);
       fds[0].revents = 0;
       size_t size = 0;
@@ -161,9 +162,14 @@ void* handle_tcp_connection(void *ctx) {
 
       /* Request is incomplete */
       if (pret == -2) break;
+
+      /* Parse Error */
       if (pret == -1) {
         printf("Parse Error! rsize=%d, buffer:\n%s\n", (int) rsize, buffer);
+        break;
       }
+
+      /* Else pret = number of bytes consumed */
 
       status = 1;
       printf("Request parsed!\n");
@@ -178,7 +184,15 @@ void* handle_tcp_connection(void *ctx) {
           }
 
           break;
+        } else if (headers[i].name == "Content-Length") {
+          request_content_length = atoi(headers[i].value);
         }
+      }
+
+      /* Content-Length header was present and it's value is bigger than downloaded bytes */
+      if (request_content_length != -1 && size < request_content_length + pret) {
+        printf("request_content_length: %d but read so far: %d, retrying...\n", request_content_length, (int) size);
+        break;
       }
 
       key = hash_buffer(buffer);
@@ -187,6 +201,9 @@ void* handle_tcp_connection(void *ctx) {
       if (found_entry && found_entry->timestamp > get_timestamp()) {
         serve_response_from_cache(found_entry, fds[i].fd, i);
       } else {
+        /* Request not found in internal cache, requesting target */
+
+        // TODO: Modify buffer to use "Connection: close" and custom "Host" header
         int req_sockfd = initialize_new_socket();
         ssize_t bytes_sent = 0, total_bytes_sent = 0;
         printf("New socket: %d (sending request to target)\n", req_sockfd);
@@ -267,6 +284,8 @@ void* handle_tcp_connection(void *ctx) {
               printf("Response parse error! %s\n", buffer);
             }
 
+
+
             printf("Response parsed, Received buffer: %s\n", buffer);
             close(req_fds[0].fd);
             status = 3;
@@ -289,7 +308,6 @@ void* handle_tcp_connection(void *ctx) {
       }
     } else if (fds[0].revents & POLLOUT) {
       printf("POLLOUT - %d, status=%d\n", conn_info->sck, status);
-      sleep(1);
       if (status == 2) {
         printf("napierdalam\n");
         fds[0].revents = 0;
@@ -323,6 +341,27 @@ void* handle_tcp_connection(void *ctx) {
 
   free(buffer);
   printf("poll outer end, status: %d\n", status);
+}
+
+void handle_socket(int newsockfd) {
+  pthread_t thid;
+  int rc;
+  struct connection_info conn_info;
+  conn_info.sck = newsockfd;
+
+  rc = pthread_create(&thid, NULL, handle_tcp_connection, &conn_info);
+  if (rc != 0) {
+    printf("Thread created. Rc: %d, Pid: %d, Sock: %d\n", rc, (int) thid, newsockfd);
+    rc = pthread_detach(thid);
+
+    if (rc != 0) {
+      printf("Thread detached. Rc: %d\n", rc);
+    } else {
+      printf("Failed to detach thread. Rc: %d, Errno: %d\n", rc, errno);
+    }
+  } else {
+    printf("Failed to create thread. Rc: %d, Errno: %d\n", rc, errno);
+  }
 }
 
 void run(int listen_sck_fd, configuration cfg) {
@@ -359,15 +398,7 @@ void run(int listen_sck_fd, configuration cfg) {
 
         int newsockfd = accept(listen_sck_fd, (struct sockaddr *) &cli_addr, &clilen);
         if (newsockfd > 0) {
-          pthread_t thid;
-          int rc;
-          struct connection_info conn_info;
-          conn_info.sck = newsockfd;
-
-          rc = pthread_create(&thid, NULL, handle_tcp_connection, &conn_info);
-          printf("Thread created. Rc: %d, Pid: %d, Sock: %d\n", rc, (int) thid, newsockfd);
-          rc = pthread_detach(thid);
-          printf("Thread detached. Rc: %d\n", rc);
+          handle_socket(newsockfd);
         }
       }
     }
