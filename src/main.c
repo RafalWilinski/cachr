@@ -17,9 +17,6 @@
 /* Size of buffer/chunk read */
 #define BUFSIZE 4096
 
-/* Constant message send with every tcp request */
-static const char CONNECTION_CLOSE_MSG[] = "Connection: close";
-
 /* Cached sockaddr_in structure as we're calling the same target */
 struct sockaddr_in target_serv_addr;
 
@@ -67,6 +64,55 @@ void serve_response_from_cache(struct cache_entry *found_entry, int fd, int i) {
     printf("Failed to respond to requester from cache... %d\n", (int) sent_bytes);
 
   close(fd);
+}
+
+char *rewrite_request(char *response_buffer, struct phr_header *headers, int headers_size, int headers_count,
+                      int total_size, char* method, size_t method_len, char *path, size_t path_len, int minor_version) {
+  size_t bufsize = method_len + path_len + 12, header_size = 0;
+  char *buffer = malloc(sizeof(char) * bufsize);
+
+  printf("Initial buffer: \n%s\n", response_buffer);
+
+  sprintf(buffer, "%.*s %.*s HTTP/1.%d\r\n\0", (int) method_len, method, (int) path_len, path, minor_version);
+
+  /* Rewrite headers */
+  for (int i = 0; i < headers_count; i++) {
+    char *name = malloc(sizeof(char) * headers[i].name_len);
+    char *value = malloc(sizeof(char) * headers[i].value_len);
+    sprintf(name, "%.*s\0", (int) headers[i].name_len, headers[i].name);
+    sprintf(value, "%.*s\0", (int) headers[i].value_len, headers[i].value);
+
+    printf("%s: %s rewriting...\n", name, value);
+    printf("Name len: %d, value len: %d\n", (int) headers[i].name_len, (int) headers[i].value_len);
+
+    header_size = headers[i].name_len + 4;
+
+    if (strcmp("Host", name) == 0) {
+      printf("Writing custom host...\n");
+      free(value);
+      value = malloc(sizeof(char) * (strlen(cfg.target_host) + 2));
+      strcpy(value, cfg.target_host);
+      value[strlen(value)] = '\0';
+
+      header_size += strlen(cfg.target_host);
+    } else {
+      header_size += (int) headers[i].value_len;
+    }
+
+    buffer = realloc(buffer, sizeof(char) * (bufsize + header_size));
+    sprintf(buffer + bufsize, "%s: %s\r\n\0", name, value);
+    bufsize += header_size;
+
+    free(name);
+    free(value);
+  }
+
+  /* Rewrite rest of request */
+  buffer = realloc(buffer, (size_t) (bufsize + total_size - headers_size + 2));
+  memcpy(buffer + bufsize, response_buffer + headers_size, total_size - headers_size);
+  buffer[strlen(buffer)] = '\n';
+
+  return buffer;
 }
 
 struct connection_info {
@@ -197,18 +243,19 @@ void* handle_tcp_connection(void *ctx) {
       }
 
       key = hash_buffer(buffer);
-      size = 0;
 
       HASH_FIND_INT(cache, &key, found_entry);
       if (found_entry && found_entry->timestamp > get_timestamp()) {
         serve_response_from_cache(found_entry, fds[i].fd, i);
       } else {
         /* Request not found in internal cache, requesting target */
-
-        // TODO: Modify buffer to use "Connection: close" and custom "Host" header
+        char * request_buffer = rewrite_request(buffer, headers, pret, (int) num_headers, (int) size, req_method,
+                                                method_len, req_path, path_len, minor_version);
+        printf("Request buffer: %s\n", request_buffer);
         int req_sockfd = initialize_new_socket();
         ssize_t bytes_sent = 0, total_bytes_sent = 0;
         printf("[%d] New socket: %d (sending request to target)\n", tid, req_sockfd);
+        size = 0;
 
         struct pollfd *req_fds = (struct pollfd *) calloc(1, sizeof(struct pollfd));
         req_fds[0].fd = req_sockfd;
@@ -225,9 +272,10 @@ void* handle_tcp_connection(void *ctx) {
             printf("[%d] POLLOUT2\n", tid);
             req_fds[0].revents = 0;
 
-            if (total_bytes_sent < strlen(buffer)) {
+            if (total_bytes_sent < strlen(request_buffer)) {
               printf("[%d] Sending...\n", tid);
-              while ((bytes_sent = write(req_sockfd, buffer + total_bytes_sent, strlen(buffer) - total_bytes_sent))) {
+              while ((bytes_sent = write(req_sockfd, request_buffer + total_bytes_sent,
+                                         strlen(request_buffer) - total_bytes_sent))) {
                 /* Writing should be continued later or end of transmission */
                 if (bytes_sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                   printf("[%d] Sending would block.\n", tid);
@@ -236,13 +284,14 @@ void* handle_tcp_connection(void *ctx) {
 
                 total_bytes_sent += bytes_sent;
 
-                printf("[%d] %d / %d bytes sent. (%d in this tick)\n", tid, (int) total_bytes_sent, (int) strlen(buffer),
-                       (int) bytes_sent);
+                printf("[%d] %d / %d bytes sent. (%d in this tick)\n", tid, (int) total_bytes_sent,
+                       (int) strlen(request_buffer), (int) bytes_sent);
               }
 
             } else {
+              printf("Whole request sent!!\n");
               req_fds[0].events = POLLIN;
-              free(buffer);
+              free(request_buffer);
               buffer = malloc(BUFSIZE);
               memset(buffer, 0, BUFSIZE);
               size = 0;
@@ -267,8 +316,7 @@ void* handle_tcp_connection(void *ctx) {
               /* Else (positive number of bytes) */
               size += rsize;
 
-              /* Each dot informs about chunk of data, just for debugging purposes */
-              printf("[%d] Receiving bytes from target: %d\n", tid, (int) rsize);
+              printf("[%d] Receiving bytes from target: %d, errno: %d\n", tid, (int) rsize, errno);
 
               if (res_parsed != 1) {
                 num_headers = sizeof(res_headers) / sizeof(res_headers[0]);
@@ -310,6 +358,10 @@ void* handle_tcp_connection(void *ctx) {
                 }
 
                 res_parsed = 1;
+              }
+
+              if (buffer[strlen(buffer) - 1] == '\n' && buffer[strlen(buffer) - 2] == '\r') {
+                break;
               }
 
               if (size == capacity) {
@@ -357,6 +409,7 @@ void* handle_tcp_connection(void *ctx) {
       }
     } else if (fds[0].revents & POLLOUT) {
       printf("[%d] POLLOUT - %d, status=%d\n", tid, conn_info->sck, status);
+//      usleep(1000000);
       if (status == 3) {
         fds[0].revents = 0;
         ssize_t bytes_sent = 0, total_bytes_sent = 0;
