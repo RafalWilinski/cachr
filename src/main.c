@@ -8,7 +8,6 @@
 
 #include "libs/ini.h"
 #include "error.h"
-#include "libs/stack.h"
 #include "libs/uthash.h"
 #include "configutils.h"
 #include "netutils.h"
@@ -26,9 +25,6 @@ struct sockaddr_in target_serv_addr;
 
 /* Head of cache data structure */
 struct cache_entry *cache = NULL;
-
-/* Stack of available indexes in fds array */
-stackT freeIndexesStack;
 
 /* Parsed configuration structure */
 configuration cfg;
@@ -71,7 +67,6 @@ void serve_response_from_cache(struct cache_entry *found_entry, int fd, int i) {
     printf("Failed to respond to requester from cache... %d\n", (int) sent_bytes);
 
   close(fd);
-  StackPush(&freeIndexesStack, (stackElementT) i);
 }
 
 struct connection_info {
@@ -86,15 +81,22 @@ struct connection_info {
  *  3: Sending back data to requester
  */
 void* handle_tcp_connection(void *ctx) {
-  int tid = (int) gettid();
-  struct connection_info *conn_info = ctx;
-  int read_timeout = -1, write_timeout = -1, status = -1, request_content_length = -1, response_content_length = -1;
+  int tid = (int) gettid(), read_timeout = -1, write_timeout = -1, status = -1, request_content_length = -1,
+      response_content_length = -1, ttl = cfg.ttl, i, req_parsed = 0, res_parsed = 0, res_minor_version, res_status,
+      minor_version, pret = -2;
   u_int64_t key;
+  size_t method_len, path_len, num_headers;
+  char *buffer = malloc(BUFSIZE), *req_method, *req_path;
   struct cache_entry *found_entry = NULL;
-  char *buffer = malloc(BUFSIZE);
+  struct connection_info *conn_info = ctx;
+  struct phr_header headers[100];
+  struct phr_header res_headers[100];
+  struct pollfd *fds = (struct pollfd *) calloc(1, sizeof(struct pollfd));
+
   buffer = memset(buffer, 0, BUFSIZE);
 
-  struct pollfd *fds = (struct pollfd *) calloc(1, sizeof(struct pollfd));
+  num_headers = sizeof(headers) / sizeof(headers[0]);
+
   fds[0].fd = conn_info->sck;
   fds[0].events = POLLIN;
 
@@ -113,7 +115,7 @@ void* handle_tcp_connection(void *ctx) {
       ssize_t rsize = 0, capacity = BUFSIZE;
 
       while ((rsize = read(fds[0].fd, buffer + size, capacity - size))) {
-        /* Reading should be continued later or end of transmission */
+        /* Reading should be continued later */
         if (rsize == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
           printf("[%d] would block\n", tid);
           break;
@@ -135,56 +137,67 @@ void* handle_tcp_connection(void *ctx) {
             exit(EXIT_FAILURE);
           }
         }
-      }
 
-      int ttl = cfg.ttl, i;
-      char *method, *path;
-      size_t method_len, path_len, num_headers;
-      int minor_version, pret;
-      struct phr_header headers[100];
-      num_headers = sizeof(headers) / sizeof(headers[0]);
+        /* Parse request headers only once */
+        if (req_parsed != 1) {
+          pret = phr_parse_request(buffer, size, &req_method, &method_len, &req_path, &path_len,
+                                   &minor_version, headers, &num_headers, 0);
 
-      pret = phr_parse_request(buffer, strlen(buffer), &method, &method_len, &path, &path_len,
-                               &minor_version, headers, &num_headers, 0);
-
-      /* Request is incomplete */
-      if (pret == -2) {
-        printf("[%d] Request incomplete, continue.\n", tid);
-      }
-
-      /* Parse Error */
-      if (pret == -1) {
-        printf("Parse Error! rsize=%d, buffer:\n%s\n", (int) rsize, buffer);
-        continue;
-      }
-
-      /* Else pret = number of bytes consumed */
-
-      status = 1;
-      printf("[%d] Request parsed!\n", tid);
-
-      /* In request find header called "TTL" and parse it's value to integer */
-      for (i = 0; i != num_headers; ++i) {
-        if (headers[i].name == "Cache-Control") {
-          if (headers[i].value == "no-cache" || headers[i].value == "no-store") ttl = 0;
-          else if (headers[i].value == "max-age") {
-            /* Parse "max-age=X" */
-            ttl = get_ttl_value((char *) headers[i].value);
+          /* Request is incomplete */
+          if (pret == -2) {
+            printf("[%d] Request incomplete, continue.\n", tid);
+            continue;
           }
 
-          break;
-        } else if (headers[i].name == "Content-Length") {
-          request_content_length = atoi(headers[i].value);
+          /* Parse Error */
+          if (pret == -1) {
+            printf("Parse Error! rsize=%d, buffer:\n%s\n", (int) rsize, buffer);
+            continue;
+          }
+
+          /* Else pret = number of bytes consumed */
+
+          status = 1;
+          printf("[%d] Request parsed!\n", tid);
+
+          for (i = 0; i != num_headers; ++i) {
+            char *name = malloc(sizeof(char) * headers[i].name_len);
+            char *value = malloc(sizeof(char) * headers[i].value_len);
+            sprintf(name, "%.*s", (int) headers[i].name_len, headers[i].name);
+            sprintf(value, "%.*s", (int) headers[i].value_len, headers[i].value);
+
+            if (name == "Cache-Control") {
+              if (value == "no-cache" || value == "no-store") ttl = 0;
+              else {
+                /* Parse "max-age=X" */
+                ttl = get_ttl_value((char *) value);
+              }
+
+              break;
+            } else if (name == "Content-Length") {
+              request_content_length = atoi(value);
+            }
+
+            free(name);
+            free(value);
+          }
+          req_parsed = 1;
+        }
+
+        /* Content-Length header was present and it's value is bigger than downloaded bytes */
+        if (request_content_length != -1) {
+          if (size < request_content_length + pret) {
+            printf("request_content_length: %d but read so far: %d, retrying...\n", request_content_length, (int) size);
+            continue;
+          } else {
+            printf("[%d] Whole request captured, break\n", tid);
+            break;
+          }
         }
       }
 
-      /* Content-Length header was present and it's value is bigger than downloaded bytes */
-      if (request_content_length != -1 && size < request_content_length + pret) {
-        printf("request_content_length: %d but read so far: %d, retrying...\n", request_content_length, (int) size);
-        break;
-      }
-
       key = hash_buffer(buffer);
+      size = 0;
 
       HASH_FIND_INT(cache, &key, found_entry);
       if (found_entry && found_entry->timestamp > get_timestamp()) {
@@ -202,7 +215,13 @@ void* handle_tcp_connection(void *ctx) {
         req_fds[0].events = POLLOUT;
 
         while (poll(req_fds, (nfds_t) 1, write_timeout)) {
-          if (req_fds[0].revents & POLLOUT && status == 1) {
+          if (fds[0].revents & POLLHUP) {
+            printf("[%d] Fd: %d was disconnected.\n", tid, req_fds[0].fd);
+          } else if (req_fds[0].revents & POLLNVAL) {
+            printf("[%d] Fd: %d is invalid.\n", tid, req_fds[0].fd);
+          } else if (req_fds[0].revents & POLLERR) {
+            printf("[%d] Fd: %d is broken.\n", tid, req_fds[0].fd);
+          } else if (req_fds[0].revents & POLLOUT && status == 1) {
             printf("[%d] POLLOUT2\n", tid);
             req_fds[0].revents = 0;
 
@@ -222,20 +241,20 @@ void* handle_tcp_connection(void *ctx) {
               }
 
             } else {
-              printf("[%d] Whole request sent! %s\n", tid, buffer);
-
-//              write(req_sockfd, "Host: cs.put.poznan.pl", strlen("Host: cs.put.poznan.pl"));
-
               req_fds[0].events = POLLIN;
               free(buffer);
               buffer = malloc(BUFSIZE);
+              memset(buffer, 0, BUFSIZE);
               size = 0;
               capacity = BUFSIZE;
               status = 2;
-              printf("[%d] Clear\n", tid);
             }
           } if (req_fds[0].revents & POLLIN && status == 2) {
-            printf("[%d] POLLIN2\n", tid);
+            char *msg;
+            size_t msg_len;
+
+            printf("[%d] POLLIN2 rsize:%d, size:%d,capacity: %d, buffer: %s\n", tid, (int) rsize, (int) size,
+                   (int) capacity, buffer);
             req_fds[0].revents = 0;
 
             while ((rsize = read(req_fds[0].fd, buffer + size, capacity - size))) {
@@ -251,32 +270,72 @@ void* handle_tcp_connection(void *ctx) {
               /* Each dot informs about chunk of data, just for debugging purposes */
               printf("[%d] Receiving bytes from target: %d\n", tid, (int) rsize);
 
+              if (res_parsed != 1) {
+                num_headers = sizeof(res_headers) / sizeof(res_headers[0]);
+                pret = phr_parse_response(buffer, strlen(buffer), &res_minor_version, &res_status, &msg, &msg_len,
+                                          res_headers,
+                                          &num_headers, 0);
+
+                if (pret == -2) {
+                  printf("Keep on receiving\n");
+                  continue;
+                } else if (pret == -1) {
+                  printf("Response parse error! %s\n", buffer);
+                  break;
+                }
+
+                printf("[%d] Response parsed! Headers: %d\n", tid, (int) num_headers);
+
+                for (i = 0; i != num_headers; ++i) {
+                  char *name = malloc(sizeof(char) * res_headers[i].name_len);
+                  char *value = malloc(sizeof(char) * res_headers[i].value_len);
+                  sprintf(name, "%.*s", (int) res_headers[i].name_len, res_headers[i].name);
+                  sprintf(value, "%.*s", (int) res_headers[i].value_len, res_headers[i].value);
+
+                  printf("[%d][%d] %s: %s\n", tid, i, name, value);
+
+                  if (strcmp("Cache-Control", name) == 0) {
+                    /* Override requests caching strategy by response caching strategy */
+                    if (value == "no-cache" || value == "no-store") ttl = 0;
+                    else if (value == "max-age") {
+                      /* Parse "max-age=X" */
+                      ttl = get_ttl_value((char *) value);
+                    }
+                  } else if (strcmp("Content-Length", name) == 0) {
+                    response_content_length = atoi(value);
+                  }
+
+                  free(name);
+                  free(value);
+                }
+
+                res_parsed = 1;
+              }
+
               if (size == capacity) {
-                printf("Reallocating buffer to capacity: %d\n", (int) (capacity * 2));
+                printf("[%d] Reallocating buffer to capacity: %d\n", tid, (int) (capacity * 2));
                 capacity *= 2;
                 buffer = realloc(buffer, (size_t) capacity);
 
                 if (buffer == NULL) {
-                  printf("Failed to rellocate the buffer!\n");
+                  printf("[%d] Failed to reallocate the buffer!\n", tid);
                   exit(EXIT_FAILURE);
+                }
+              }
+
+              /* Content-Length header was present and it's value is bigger than downloaded bytes */
+              if (response_content_length != -1) {
+                if (size < response_content_length + pret) {
+                  printf("[%d] response_content_length: %d but read so far: %d, retrying...\n", tid,
+                         response_content_length, (int) size);
+                  continue;
+                } else {
+                  printf("[%d] Whole request downloaded\n", tid);
+                  break;
                 }
               }
             }
 
-            int minor_version, status;
-            char *msg;
-            size_t msg_len;
-
-            num_headers = sizeof(headers) / sizeof(headers[0]);
-            pret = phr_parse_response(buffer, strlen(buffer), &minor_version, &status, &msg, &msg_len, headers, &num_headers, 0);
-            if (pret == -2) break;
-            if (pret == -1) {
-              printf("Response parse error! %s\n", buffer);
-            }
-
-
-
-            printf("Response parsed, Received buffer: %s\n", buffer);
             close(req_fds[0].fd);
             status = 3;
             fds[0].events = POLLOUT;
@@ -298,14 +357,14 @@ void* handle_tcp_connection(void *ctx) {
       }
     } else if (fds[0].revents & POLLOUT) {
       printf("[%d] POLLOUT - %d, status=%d\n", tid, conn_info->sck, status);
-      if (status == 2) {
+      if (status == 3) {
         fds[0].revents = 0;
         ssize_t bytes_sent = 0, total_bytes_sent = 0;
 
         if (total_bytes_sent < strlen(buffer)) {
           printf("[%d] Sending...\n", tid);
-          while ((bytes_sent = write(fds[0].fd, buffer + total_bytes_sent, strlen(buffer - total_bytes_sent)))) {
-            /* Writing should be continued later or end of transmission */
+          while ((bytes_sent = write(fds[0].fd, buffer + total_bytes_sent, strlen(buffer) - total_bytes_sent))) {
+            /* Writing should be continued later */
             if (bytes_sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
               printf("[%d] Sending would block.\n", tid);
               break;
@@ -321,9 +380,13 @@ void* handle_tcp_connection(void *ctx) {
               printf("[%d] End\n", tid);
               status = 0;
               break;
+            } else {
+              printf(".");
             }
           }
         }
+      } else {
+        printf("[%d] Incorrect flow status! %d\n", tid, status);
       }
     }
   }
@@ -363,15 +426,8 @@ void run(int listen_sck_fd, configuration cfg) {
   int request_fds[cfg.fds_count];
   for(int j = 0; j < cfg.fds_count; j++) request_fds[j] = 0;
 
-  /* Initialize stack of free indexes in fds array */
-  StackInit(&freeIndexesStack, cfg.fds_count);
-
   fds[0].fd = listen_sck_fd;
   fds[0].events = POLLIN;
-
-  int i = 0;
-  for (i = cfg.fds_count - 1; i > 0; i--)
-    StackPush(&freeIndexesStack, (stackElementT) (i));
 
   /* Get sockaddr_in structure only once as it's unlikely to change */
   target_serv_addr = get_server_addr(cfg);
@@ -381,7 +437,7 @@ void run(int listen_sck_fd, configuration cfg) {
   }
 
   while (poll(fds, (nfds_t) 1, -1)) {
-    fds[i].revents = 0;
+    fds[0].revents = 0;
 
     int newsockfd = accept(listen_sck_fd, (struct sockaddr *) &cli_addr, &clilen);
     if (newsockfd > 0) {
