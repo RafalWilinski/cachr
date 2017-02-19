@@ -27,12 +27,6 @@ struct sockaddr_in target_serv_addr;
 /* Head of cache data structure */
 struct cache_entry *cache = NULL;
 
-/* Head of socket-request pairs dictionaryy structure */
-struct socket_request_pair *pairs = NULL;
-
-/* Number of sockets connected in fds array */
-int sck_cnt = 1;
-
 /* Stack of available indexes in fds array */
 stackT freeIndexesStack;
 
@@ -44,14 +38,6 @@ struct cache_entry {
   char* buffer;
   long timestamp;
   u_int32_t bytes;
-  struct UT_hash_handle hh;
-};
-
-struct socket_request_pair {
-  u_int64_t key;
-  char* buffer;
-  int idx;
-  int ttl;
   struct UT_hash_handle hh;
 };
 
@@ -100,6 +86,7 @@ struct connection_info {
  *  3: Sending back data to requester
  */
 void* handle_tcp_connection(void *ctx) {
+  int tid = (int) gettid();
   struct connection_info *conn_info = ctx;
   int read_timeout = -1, write_timeout = -1, status = -1, request_content_length = -1, response_content_length = -1;
   u_int64_t key;
@@ -113,14 +100,14 @@ void* handle_tcp_connection(void *ctx) {
 
   while (poll(fds, (nfds_t) 1, read_timeout) && (status != 0)) {
     if (fds[0].revents & POLLHUP) {
-      printf("Fd: %d was disconnected.\n", conn_info->sck);
+      printf("[%d] Fd: %d was disconnected.\n", tid, conn_info->sck);
     } else if (fds[0].revents & POLLNVAL) {
-      printf("Fd: %d is invalid.\n", conn_info->sck);
+      printf("[%d] Fd: %d is invalid.\n", tid, conn_info->sck);
     } else if (fds[0].revents & POLLERR) {
-      printf("Fd: %d is broken.\n", conn_info->sck);
+      printf("[%d] Fd: %d is broken.\n", tid, conn_info->sck);
     } else if (fds[0].revents & POLLIN && status == -1) {
       /* Handle Incoming Request to proxy */
-      printf("POLLIN - %d\n", conn_info->sck);
+      printf("[%d] POLLIN - %d\n", tid, conn_info->sck);
       fds[0].revents = 0;
       size_t size = 0;
       ssize_t rsize = 0, capacity = BUFSIZE;
@@ -128,7 +115,7 @@ void* handle_tcp_connection(void *ctx) {
       while ((rsize = read(fds[0].fd, buffer + size, capacity - size))) {
         /* Reading should be continued later or end of transmission */
         if (rsize == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-          printf("would block\n");
+          printf("[%d] would block\n", tid);
           break;
         }
 
@@ -136,7 +123,7 @@ void* handle_tcp_connection(void *ctx) {
         size += rsize;
 
         /* Each dot informs about chunk of data, just for debugging purposes */
-        printf("Receiving bytes: %d\n", rsize);
+        printf("[%d] Receiving bytes: %d\n", tid, (int) rsize);
 
         if (size == capacity) {
           printf("Reallocating buffer to capacity: %d\n", (int) (capacity * 2));
@@ -161,18 +148,20 @@ void* handle_tcp_connection(void *ctx) {
                                &minor_version, headers, &num_headers, 0);
 
       /* Request is incomplete */
-      if (pret == -2) break;
+      if (pret == -2) {
+        printf("[%d] Request incomplete, continue.\n", tid);
+      }
 
       /* Parse Error */
       if (pret == -1) {
         printf("Parse Error! rsize=%d, buffer:\n%s\n", (int) rsize, buffer);
-        break;
+        continue;
       }
 
       /* Else pret = number of bytes consumed */
 
       status = 1;
-      printf("Request parsed!\n");
+      printf("[%d] Request parsed!\n", tid);
 
       /* In request find header called "TTL" and parse it's value to integer */
       for (i = 0; i != num_headers; ++i) {
@@ -206,7 +195,7 @@ void* handle_tcp_connection(void *ctx) {
         // TODO: Modify buffer to use "Connection: close" and custom "Host" header
         int req_sockfd = initialize_new_socket();
         ssize_t bytes_sent = 0, total_bytes_sent = 0;
-        printf("New socket: %d (sending request to target)\n", req_sockfd);
+        printf("[%d] New socket: %d (sending request to target)\n", tid, req_sockfd);
 
         struct pollfd *req_fds = (struct pollfd *) calloc(1, sizeof(struct pollfd));
         req_fds[0].fd = req_sockfd;
@@ -214,28 +203,28 @@ void* handle_tcp_connection(void *ctx) {
 
         while (poll(req_fds, (nfds_t) 1, write_timeout)) {
           if (req_fds[0].revents & POLLOUT && status == 1) {
-            printf("POLLOUT2\n");
+            printf("[%d] POLLOUT2\n", tid);
             req_fds[0].revents = 0;
 
             if (total_bytes_sent < strlen(buffer)) {
-              printf("Sending...\n");
-              while ((bytes_sent = write(req_sockfd, buffer + total_bytes_sent, strlen(buffer - total_bytes_sent)))) {
+              printf("[%d] Sending...\n", tid);
+              while ((bytes_sent = write(req_sockfd, buffer + total_bytes_sent, strlen(buffer) - total_bytes_sent))) {
                 /* Writing should be continued later or end of transmission */
                 if (bytes_sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                  printf("Sending would block.\n");
+                  printf("[%d] Sending would block.\n", tid);
                   break;
                 }
 
                 total_bytes_sent += bytes_sent;
 
-                printf("%d / %d bytes sent. (%d in this tick)\n", (int) total_bytes_sent, (int) strlen(buffer),
+                printf("[%d] %d / %d bytes sent. (%d in this tick)\n", tid, (int) total_bytes_sent, (int) strlen(buffer),
                        (int) bytes_sent);
               }
 
             } else {
-              printf("Whole request sent! %s\n", buffer);
+              printf("[%d] Whole request sent! %s\n", tid, buffer);
 
-              write(req_sockfd, "Host: cs.put.poznan.pl", strlen("Host: cs.put.poznan.pl"));
+//              write(req_sockfd, "Host: cs.put.poznan.pl", strlen("Host: cs.put.poznan.pl"));
 
               req_fds[0].events = POLLIN;
               free(buffer);
@@ -243,15 +232,16 @@ void* handle_tcp_connection(void *ctx) {
               size = 0;
               capacity = BUFSIZE;
               status = 2;
+              printf("[%d] Clear\n", tid);
             }
           } if (req_fds[0].revents & POLLIN && status == 2) {
-            printf("POLLIN2\n");
+            printf("[%d] POLLIN2\n", tid);
             req_fds[0].revents = 0;
 
             while ((rsize = read(req_fds[0].fd, buffer + size, capacity - size))) {
               /* Reading should be continued later or end of transmission */
               if (rsize == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                printf("would block\n");
+                printf("[%d] would block\n", tid);
                 break;
               }
 
@@ -259,7 +249,7 @@ void* handle_tcp_connection(void *ctx) {
               size += rsize;
 
               /* Each dot informs about chunk of data, just for debugging purposes */
-              printf("Receiving bytes from target: %d\n", (int) rsize);
+              printf("[%d] Receiving bytes from target: %d\n", tid, (int) rsize);
 
               if (size == capacity) {
                 printf("Reallocating buffer to capacity: %d\n", (int) (capacity * 2));
@@ -307,29 +297,28 @@ void* handle_tcp_connection(void *ctx) {
         }
       }
     } else if (fds[0].revents & POLLOUT) {
-      printf("POLLOUT - %d, status=%d\n", conn_info->sck, status);
+      printf("[%d] POLLOUT - %d, status=%d\n", tid, conn_info->sck, status);
       if (status == 2) {
-        printf("napierdalam\n");
         fds[0].revents = 0;
         ssize_t bytes_sent = 0, total_bytes_sent = 0;
 
         if (total_bytes_sent < strlen(buffer)) {
-          printf("Sending...\n");
+          printf("[%d] Sending...\n", tid);
           while ((bytes_sent = write(fds[0].fd, buffer + total_bytes_sent, strlen(buffer - total_bytes_sent)))) {
             /* Writing should be continued later or end of transmission */
             if (bytes_sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-              printf("Sending would block.\n");
+              printf("[%d] Sending would block.\n", tid);
               break;
             }
 
             total_bytes_sent += bytes_sent;
 
-            printf("%d / %d bytes sent. (%d in this tick)\n", (int) total_bytes_sent, (int) strlen(buffer),
+            printf("[%d] %d / %d bytes sent. (%d in this tick)\n", tid, (int) total_bytes_sent, (int) strlen(buffer),
                    (int) bytes_sent);
 
             if (total_bytes_sent == strlen(buffer)) {
               close(fds[0].fd);
-              printf("End\n");
+              printf("[%d] End\n", tid);
               status = 0;
               break;
             }
@@ -340,7 +329,8 @@ void* handle_tcp_connection(void *ctx) {
   }
 
   free(buffer);
-  printf("poll outer end, status: %d\n", status);
+  printf("[%d] poll outer end, status: %d\n", tid, status);
+  pthread_exit(NULL);
 }
 
 void handle_socket(int newsockfd) {
@@ -350,12 +340,12 @@ void handle_socket(int newsockfd) {
   conn_info.sck = newsockfd;
 
   rc = pthread_create(&thid, NULL, handle_tcp_connection, &conn_info);
-  if (rc != 0) {
-    printf("Thread created. Rc: %d, Pid: %d, Sock: %d\n", rc, (int) thid, newsockfd);
+  if (rc == 0) {
+    printf("[%d] Thread created. Sock: %d\n", (int) thid, newsockfd);
     rc = pthread_detach(thid);
 
-    if (rc != 0) {
-      printf("Thread detached. Rc: %d\n", rc);
+    if (rc == 0) {
+      printf("[%d] Thread detached.\n", (int) thid);
     } else {
       printf("Failed to detach thread. Rc: %d, Errno: %d\n", rc, errno);
     }
@@ -365,7 +355,6 @@ void handle_socket(int newsockfd) {
 }
 
 void run(int listen_sck_fd, configuration cfg) {
-  int upperBound = 1;
   socklen_t clilen;
 
   struct sockaddr_in cli_addr;
@@ -391,16 +380,12 @@ void run(int listen_sck_fd, configuration cfg) {
     exit(EXIT_FAILURE);
   }
 
-  while (poll(fds, (nfds_t) sck_cnt, -1)) {
-    for (i = 0; i < upperBound; i++) {
-      if (i == 0) {
-        fds[i].revents = 0;
+  while (poll(fds, (nfds_t) 1, -1)) {
+    fds[i].revents = 0;
 
-        int newsockfd = accept(listen_sck_fd, (struct sockaddr *) &cli_addr, &clilen);
-        if (newsockfd > 0) {
-          handle_socket(newsockfd);
-        }
-      }
+    int newsockfd = accept(listen_sck_fd, (struct sockaddr *) &cli_addr, &clilen);
+    if (newsockfd > 0) {
+      handle_socket(newsockfd);
     }
   }
 }

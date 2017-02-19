@@ -3,5 +3,6 @@
 
 long get_timestamp();
 u_int64_t hash_buffer(char* str);
+uint64_t gettid();
 
 #endif //CACHR_UTILS_H
