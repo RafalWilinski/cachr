@@ -14,26 +14,30 @@ make
 
 ### Using
 You can test solution with following command:
-```
-curl -X GET localhost:3000/endpoint?data=1 -w %{time_connect}:%{time_starttransfer}:%{time_total}
+```bash
+./test/request.sh
 ```
 
-First request response time should be considerably bigger than subsequent calls response time.
+or 
+
+```bash
+curl localhost:3001/one_second -w %{time_connect}:%{time_starttransfer}:%{time_total} & 
+curl localhost:3001/one_second -w %{time_connect}:%{time_starttransfer}:%{time_total} &
+```
+
+First request response time should be considerably bigger than subsequent calls' response time.
 
 ### Todo
 - [x] Add/implement stack (stack will indicate empty positions in `fds` array)
 - [x] Make requests to target
 - [x] Store request results in dictionary
-- [ ] CRON-like mechanism for freeing memory in dicitonary
-- [ ] Returning dict contents if possible
-- [ ] Tests
-
-##### Nice to have
-- [x] Resolve non-blocking issues
-- [ ] Better error handling with `strerror`
+- [x] CRON-like mechanism for freeing memory in dicitonary
+- [x] Returning dict contents if possible
+- [x] Tests
 
 ### License
 [MIT License](https://opensource.org/licenses/MIT) © Marcin Elantkowski, Rafał Wiliński
 
 ### Libraries Used
  - [inih](https://github.com/benhoyt/inih)
+ - [uthash](https://github.com/troydhanson/uthash)
