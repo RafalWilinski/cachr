@@ -52,14 +52,16 @@ int initialize_new_socket() {
 
 int get_ttl_value(char *header_value) {
   char *separator = "=";
-  char *b = strtok(header_value, separator);
-  char *c = strtok(NULL, "");
-  printf("c: %s\n", c);
-  return atoi(c);
+  char *key = strtok(header_value, separator);
+  char *value = strtok(NULL, "");
+  if (strcmp(key, "max-age") == 0) {
+    return atoi(value);
+  }
+  return 0;
 };
 
 void serve_response_from_cache(struct cache_entry *found_entry, int fd) {
-  printf("Serving response from cache (%d bytes) to fd: %d\n", found_entry->bytes, fd);
+  printf("[%d] Serving response from cache (%d bytes) to fd: %d\n", (int) gettid(), found_entry->bytes, fd);
 
   struct pollfd *fds = (struct pollfd *) calloc(1, sizeof(struct pollfd));
   int tid = (int) gettid();
@@ -115,13 +117,10 @@ char *rewrite_request(char *response_buffer, struct phr_header *headers, int hea
     sprintf(name, "%.*s\0", (int) headers[i].name_len, headers[i].name);
     sprintf(value, "%.*s\0", (int) headers[i].value_len, headers[i].value);
 
-    printf("%s: %s rewriting...\n", name, value);
-    printf("Name len: %d, value len: %d\n", (int) headers[i].name_len, (int) headers[i].value_len);
-
     header_size = headers[i].name_len + 4;
 
     if (strcmp("Host", name) == 0) {
-      printf("Writing custom host...\n");
+      printf("[%d] Writing custom host...\n", (int) gettid());
       free(value);
       value = malloc(sizeof(char) * (strlen(cfg.target_host) + 2));
       strcpy(value, cfg.target_host);
@@ -186,7 +185,7 @@ void* handle_tcp_connection(void *ctx) {
       printf("[%d] Fd: %d is broken.\n", tid, sck);
     } else if (fds[0].revents & POLLIN && status == -1) {
       /* Handle Incoming Request to proxy */
-      printf("[%d] POLLIN - %d\n", tid, sck);
+      printf("[%d] POLLIN OUTER - %d\n", tid, sck);
       fds[0].revents = 0;
       size_t size = 0;
       ssize_t rsize = 0, capacity = BUFSIZE;
@@ -205,12 +204,12 @@ void* handle_tcp_connection(void *ctx) {
         printf("[%d] Receiving bytes: %d\n", tid, (int) rsize);
 
         if (size == capacity) {
-          printf("Reallocating buffer to capacity: %d\n", (int) (capacity * 2));
+          printf("[%d] Reallocating buffer to capacity: %d\n", tid, (int) (capacity * 2));
           capacity *= 2;
           buffer = realloc(buffer, (size_t) capacity);
 
           if (buffer == NULL) {
-            printf("Failed to rellocate the buffer!\n");
+            printf("[%d] Failed to rellocate the buffer!\n", tid);
             exit(EXIT_FAILURE);
           }
         }
@@ -228,7 +227,7 @@ void* handle_tcp_connection(void *ctx) {
 
           /* Parse Error */
           if (pret == -1) {
-            printf("Parse Error! rsize=%d, buffer:\n%s\n", (int) rsize, buffer);
+            printf("[%d] Parse Error! rsize=%d, buffer:\n%s\n", tid, (int) rsize, buffer);
             continue;
           }
 
@@ -243,16 +242,17 @@ void* handle_tcp_connection(void *ctx) {
             sprintf(name, "%.*s", (int) headers[i].name_len, headers[i].name);
             sprintf(value, "%.*s", (int) headers[i].value_len, headers[i].value);
 
-            if (name == "Cache-Control") {
-              if (value == "no-cache" || value == "no-store") ttl = 0;
+            if(strcmp(name, "Cache-Control") == 0) {
+              if (strcmp(value, "no-cache") == 0 || strcmp(value, "no-store") == 0) ttl = 0;
               else {
-                /* Parse "max-age=X" */
-                ttl = get_ttl_value((char *) value);
+                ttl = get_ttl_value(value);
               }
 
               break;
-            } else if (name == "Content-Length") {
+            } else if (strcmp("Content-Length", name) == 0) {
               request_content_length = atoi(value);
+            } else if (strcmp("Pragma", name) == 0) {
+              if (strcmp("no-cache", value) == 0) ttl = 0;
             }
 
             free(name);
@@ -264,7 +264,8 @@ void* handle_tcp_connection(void *ctx) {
         /* Content-Length header was present and it's value is bigger than downloaded bytes */
         if (request_content_length != -1) {
           if (size < request_content_length + pret) {
-            printf("request_content_length: %d but read so far: %d, retrying...\n", request_content_length, (int) size);
+            printf("[%d] request_content_length: %d but read so far: %d, retrying...\n", tid,
+                   request_content_length, (int) size);
             continue;
           } else {
             printf("[%d] Whole request captured, break\n", tid);
@@ -283,10 +284,16 @@ void* handle_tcp_connection(void *ctx) {
       if (found_entry && found_entry->timestamp > get_timestamp()) {
         serve_response_from_cache(found_entry, fds[0].fd);
       } else {
+        if (found_entry) {
+          printf("[%d] Entry found but was too old. %d vs %d\n", tid, (int) found_entry->timestamp,
+                 (int) get_timestamp());
+        }
         /* Request not found in internal cache, requesting target */
         char * request_buffer = rewrite_request(buffer, headers, pret, (int) num_headers, (int) size, req_method,
                                                 method_len, req_path, path_len, minor_version);
-        printf("Request buffer: %s\n", request_buffer);
+
+//        printf("Request buffer: %s\n", request_buffer);
+
         int req_sockfd = initialize_new_socket();
         ssize_t bytes_sent = 0, total_bytes_sent = 0;
         printf("[%d] New socket: %d (sending request to target)\n", tid, req_sockfd);
@@ -304,7 +311,7 @@ void* handle_tcp_connection(void *ctx) {
           } else if (req_fds[0].revents & POLLERR) {
             printf("[%d] Fd: %d is broken.\n", tid, req_fds[0].fd);
           } else if (req_fds[0].revents & POLLOUT && status == 1) {
-            printf("[%d] POLLOUT2\n", tid);
+            printf("[%d] POLLOUT INNER\n", tid);
             req_fds[0].revents = 0;
 
             if (total_bytes_sent < strlen(request_buffer)) {
@@ -324,7 +331,7 @@ void* handle_tcp_connection(void *ctx) {
               }
 
             } else {
-              printf("Whole request sent!!\n");
+              printf("[%d] Whole request sent.\n", tid);
               req_fds[0].events = POLLIN;
               free(request_buffer);
               buffer = malloc(BUFSIZE);
@@ -337,7 +344,7 @@ void* handle_tcp_connection(void *ctx) {
             char *msg;
             size_t msg_len;
 
-            printf("[%d] POLLIN2 rsize:%d, size:%d,capacity: %d, buffer: %s\n", tid, (int) rsize, (int) size,
+            printf("[%d] POLLIN INNER rsize: %d, size: %d,capacity: %d, buffer: %s\n", tid, (int) rsize, (int) size,
                    (int) capacity, buffer);
             req_fds[0].revents = 0;
 
@@ -360,10 +367,10 @@ void* handle_tcp_connection(void *ctx) {
                                           &num_headers, 0);
 
                 if (pret == -2) {
-                  printf("Keep on receiving\n");
+                  /* Keep on receiving, request incomplete */
                   continue;
                 } else if (pret == -1) {
-                  printf("Response parse error! %s\n", buffer);
+                  printf("Response parse error! pret=1%s\n", buffer);
                   break;
                 }
 
@@ -379,8 +386,8 @@ void* handle_tcp_connection(void *ctx) {
 
                   if (strcmp("Cache-Control", name) == 0) {
                     /* Override requests caching strategy by response caching strategy */
-                    if (value == "no-cache" || value == "no-store") ttl = 0;
-                    else if (value == "max-age") {
+                    if (strcmp(value, "no-cache") == 0 || strcmp(value, "no-store") == 0) ttl = 0;
+                    else {
                       /* Parse "max-age=X" */
                       ttl = get_ttl_value((char *) value);
                     }
@@ -424,17 +431,20 @@ void* handle_tcp_connection(void *ctx) {
             }
 
 
-            struct cache_entry *entry = (struct cache_entry *) malloc(sizeof(struct cache_entry));
-            entry->key = key;
-            entry->timestamp = get_timestamp() + ttl;
-            entry->buffer = malloc(size);
-            entry->bytes = (u_int32_t) size;
-            strcpy(entry->buffer, buffer);
+            /* Save to cache only if TTL is greater than zero */
+            if (ttl > 0) {
+              struct cache_entry *entry = (struct cache_entry *) malloc(sizeof(struct cache_entry));
+              entry->key = key;
+              entry->timestamp = get_timestamp() + ttl;
+              entry->buffer = malloc(size);
+              entry->bytes = (u_int32_t) size;
+              strcpy(entry->buffer, buffer);
 
-            /* Avoid concurrent writes */
-            pthread_mutex_lock(&cache_mutex);
-            HASH_ADD_INT(cache, key, entry);
-            pthread_mutex_unlock(&cache_mutex);
+              /* Avoid concurrent writes */
+              pthread_mutex_lock(&cache_mutex);
+              HASH_ADD_INT(cache, key, entry);
+              pthread_mutex_unlock(&cache_mutex);
+            }
 
             close(req_fds[0].fd);
             status = 3;
@@ -445,7 +455,7 @@ void* handle_tcp_connection(void *ctx) {
         }
       }
     } else if (fds[0].revents & POLLOUT) {
-      printf("[%d] POLLOUT - %d, status=%d\n", tid, sck, status);
+      printf("[%d] POLLOUT OUTER - %d, status=%d\n", tid, sck, status);
       if (status == 3) {
         fds[0].revents = 0;
         ssize_t bytes_sent = 0, total_bytes_sent = 0;
