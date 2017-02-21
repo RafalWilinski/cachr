@@ -55,15 +55,45 @@ int get_ttl_value(char *header_value) {
   return atoi(c);
 };
 
-void serve_response_from_cache(struct cache_entry *found_entry, int fd, int i) {
+void serve_response_from_cache(struct cache_entry *found_entry, int fd) {
   printf("Serving response from cache (%d bytes) to fd: %d\n", found_entry->bytes, fd);
-  ssize_t sent_bytes = write(fd, found_entry->buffer, found_entry->bytes);
-  if (sent_bytes > 0)
-    printf("Cached response. %d bytes sent.\n", (int) sent_bytes);
-  else
-    printf("Failed to respond to requester from cache... %d\n", (int) sent_bytes);
 
-  close(fd);
+  struct pollfd *fds = (struct pollfd *) calloc(1, sizeof(struct pollfd));
+  int tid = (int) gettid();
+
+  fds[0].fd = fd;
+  fds[0].events = POLLOUT;
+
+  while (poll(fds, (nfds_t) 1, -1)) {
+    if (fds[0].revents & POLLOUT) {
+      fds[0].revents = 0;
+      ssize_t bytes_sent = 0, total_bytes_sent = 0;
+
+      if (total_bytes_sent < found_entry->bytes) {
+        printf("[%d] Sending cached response...\n", tid);
+        while ((bytes_sent = write(fds[0].fd, found_entry->buffer + total_bytes_sent,
+                                   (size_t) (found_entry->bytes - total_bytes_sent)))) {
+          /* Writing should be continued later */
+          if (bytes_sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            printf("[%d] Sending would block.\n", tid);
+            break;
+          }
+
+          total_bytes_sent += bytes_sent;
+
+          printf("[%d] %d / %d bytes sent. (%d in this tick)\n", tid, (int) total_bytes_sent, found_entry->bytes,
+                 (int) bytes_sent);
+
+          if (total_bytes_sent == found_entry->bytes) {
+            close(fds[0].fd);
+
+            printf("[%d] Cached response sent.\n", tid);
+            pthread_exit(NULL);
+          }
+        }
+      }
+    }
+  }
 }
 
 char *rewrite_request(char *response_buffer, struct phr_header *headers, int headers_size, int headers_count,
@@ -244,7 +274,7 @@ void* handle_tcp_connection(void *ctx) {
 
       HASH_FIND_INT(cache, &key, found_entry);
       if (found_entry && found_entry->timestamp > get_timestamp()) {
-        serve_response_from_cache(found_entry, fds[i].fd, i);
+        serve_response_from_cache(found_entry, fds[0].fd);
       } else {
         /* Request not found in internal cache, requesting target */
         char * request_buffer = rewrite_request(buffer, headers, pret, (int) num_headers, (int) size, req_method,
@@ -386,22 +416,20 @@ void* handle_tcp_connection(void *ctx) {
               }
             }
 
+            struct cache_entry *entry = (struct cache_entry *) malloc(sizeof(struct cache_entry));
+            entry->key = key;
+            entry->timestamp = get_timestamp() + ttl;
+            entry->buffer = malloc(size);
+            entry->bytes = (u_int32_t) size;
+            strcpy(entry->buffer, buffer);
+
+            HASH_ADD_INT(cache, key, entry);
+
             close(req_fds[0].fd);
             status = 3;
             fds[0].events = POLLOUT;
             printf("Closing sock=%d, status: %d\n", req_fds[0].fd, status);
             break;
-
-            /*
-             * struct cache_entry *entry = (struct cache_entry *) malloc(sizeof(struct cache_entry));
-              entry->key = hash_buffer(pair->buffer);
-              entry->timestamp = get_timestamp() + pair->ttl;
-              entry->buffer = malloc(bytes);
-              entry->bytes = bytes;
-              strcpy(entry->buffer, buffer);
-
-              HASH_ADD_INT(cache, key, entry);
-             */
           }
         }
       }
@@ -430,18 +458,18 @@ void* handle_tcp_connection(void *ctx) {
               printf("[%d] End\n", tid);
               status = 0;
               break;
-            } else {
-              printf(".");
             }
           }
         }
       } else {
-        printf("[%d] Incorrect flow status! %d\n", tid, status);
+        printf("[%d] Incorrect status! %d\n", tid, status);
       }
     }
   }
 
   free(buffer);
+  free(fds);
+
   printf("[%d] poll outer end, status: %d\n", tid, status);
   pthread_exit(NULL);
 }
@@ -518,5 +546,7 @@ int main(int argc, char **argv) {
   }
 
   run(listen_sck, cfg);
+
+  free(cache);
   return 0;
 }
