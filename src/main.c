@@ -26,6 +26,9 @@ struct cache_entry *cache = NULL;
 /* Parsed configuration structure */
 configuration cfg;
 
+/* Cache mutex */
+pthread_mutex_t cache_mutex;
+
 struct cache_entry {
   u_int64_t key;
   char* buffer;
@@ -272,7 +275,11 @@ void* handle_tcp_connection(void *ctx) {
 
       key = hash_buffer(buffer);
 
+      /* Avoid concurrent access */
+      pthread_mutex_lock(&cache_mutex);
       HASH_FIND_INT(cache, &key, found_entry);
+      pthread_mutex_unlock(&cache_mutex);
+
       if (found_entry && found_entry->timestamp > get_timestamp()) {
         serve_response_from_cache(found_entry, fds[0].fd);
       } else {
@@ -416,6 +423,7 @@ void* handle_tcp_connection(void *ctx) {
               }
             }
 
+
             struct cache_entry *entry = (struct cache_entry *) malloc(sizeof(struct cache_entry));
             entry->key = key;
             entry->timestamp = get_timestamp() + ttl;
@@ -423,7 +431,10 @@ void* handle_tcp_connection(void *ctx) {
             entry->bytes = (u_int32_t) size;
             strcpy(entry->buffer, buffer);
 
+            /* Avoid concurrent writes */
+            pthread_mutex_lock(&cache_mutex);
             HASH_ADD_INT(cache, key, entry);
+            pthread_mutex_unlock(&cache_mutex);
 
             close(req_fds[0].fd);
             status = 3;
