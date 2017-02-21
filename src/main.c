@@ -115,10 +115,6 @@ char *rewrite_request(char *response_buffer, struct phr_header *headers, int hea
   return buffer;
 }
 
-struct connection_info {
-  int sck;
-};
-
 /*
  * Statuses:
  * -1: Receiving data from requester
@@ -130,11 +126,11 @@ void* handle_tcp_connection(void *ctx) {
   int tid = (int) gettid(), read_timeout = -1, write_timeout = -1, status = -1, request_content_length = -1,
       response_content_length = -1, ttl = cfg.ttl, i, req_parsed = 0, res_parsed = 0, res_minor_version, res_status,
       minor_version, pret = -2;
+  int sck = (int) ctx;
   u_int64_t key;
   size_t method_len, path_len, num_headers;
   char *buffer = malloc(BUFSIZE), *req_method, *req_path;
   struct cache_entry *found_entry = NULL;
-  struct connection_info *conn_info = ctx;
   struct phr_header headers[100];
   struct phr_header res_headers[100];
   struct pollfd *fds = (struct pollfd *) calloc(1, sizeof(struct pollfd));
@@ -143,19 +139,21 @@ void* handle_tcp_connection(void *ctx) {
 
   num_headers = sizeof(headers) / sizeof(headers[0]);
 
-  fds[0].fd = conn_info->sck;
+  fds[0].fd = (int) ctx;
   fds[0].events = POLLIN;
+
+  printf("[%d] Polling... FD: %d\n", (int) gettid(), sck);
 
   while (poll(fds, (nfds_t) 1, read_timeout) && (status != 0)) {
     if (fds[0].revents & POLLHUP) {
-      printf("[%d] Fd: %d was disconnected.\n", tid, conn_info->sck);
+      printf("[%d] Fd: %d was disconnected.\n", tid, sck);
     } else if (fds[0].revents & POLLNVAL) {
-      printf("[%d] Fd: %d is invalid.\n", tid, conn_info->sck);
+      printf("[%d] Fd: %d is invalid.\n", tid, sck);
     } else if (fds[0].revents & POLLERR) {
-      printf("[%d] Fd: %d is broken.\n", tid, conn_info->sck);
+      printf("[%d] Fd: %d is broken.\n", tid, sck);
     } else if (fds[0].revents & POLLIN && status == -1) {
       /* Handle Incoming Request to proxy */
-      printf("[%d] POLLIN - %d\n", tid, conn_info->sck);
+      printf("[%d] POLLIN - %d\n", tid, sck);
       fds[0].revents = 0;
       size_t size = 0;
       ssize_t rsize = 0, capacity = BUFSIZE;
@@ -360,7 +358,7 @@ void* handle_tcp_connection(void *ctx) {
                 res_parsed = 1;
               }
 
-              if (buffer[strlen(buffer) - 1] == '\n' && buffer[strlen(buffer) - 2] == '\r') {
+              if (buffer[strlen(buffer) - 1] == '\n' && buffer[strlen(buffer) - 2] == '\n') {
                 break;
               }
 
@@ -408,8 +406,7 @@ void* handle_tcp_connection(void *ctx) {
         }
       }
     } else if (fds[0].revents & POLLOUT) {
-      printf("[%d] POLLOUT - %d, status=%d\n", tid, conn_info->sck, status);
-//      usleep(1000000);
+      printf("[%d] POLLOUT - %d, status=%d\n", tid, sck, status);
       if (status == 3) {
         fds[0].revents = 0;
         ssize_t bytes_sent = 0, total_bytes_sent = 0;
@@ -452,10 +449,8 @@ void* handle_tcp_connection(void *ctx) {
 void handle_socket(int newsockfd) {
   pthread_t thid;
   int rc;
-  struct connection_info conn_info;
-  conn_info.sck = newsockfd;
 
-  rc = pthread_create(&thid, NULL, handle_tcp_connection, &conn_info);
+  rc = pthread_create(&thid, NULL, handle_tcp_connection, (void *) newsockfd);
   if (rc == 0) {
     printf("[%d] Thread created. Sock: %d\n", (int) thid, newsockfd);
     rc = pthread_detach(thid);
