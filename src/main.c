@@ -30,7 +30,7 @@ configuration cfg;
 pthread_mutex_t cache_mutex;
 
 struct cache_entry {
-  u_int64_t key;
+  uint64_t key;
   char* buffer;
   long timestamp;
   u_int32_t bytes;
@@ -159,7 +159,7 @@ void* handle_tcp_connection(void *ctx) {
       response_content_length = -1, ttl = cfg.ttl, i, req_parsed = 0, res_parsed = 0, res_minor_version, res_status,
       minor_version, pret = -2;
   int sck = (int) ctx;
-  u_int64_t key;
+  uint64_t key;
   size_t method_len, path_len, num_headers;
   char *buffer = malloc(BUFSIZE), *req_method, *req_path;
   struct cache_entry *found_entry = NULL;
