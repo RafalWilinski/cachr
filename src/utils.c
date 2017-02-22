@@ -1,10 +1,12 @@
 #include <sys/time.h>
-/* u_int64_t */
-#include <ntsid.h>
 #include <stdint.h>
 #include <string.h>
 #include <pthread.h>
 #include "utils.h"
+
+#if __APPLE__
+#include <ntsid.h>
+#endif
 
 long get_timestamp() {
   return (unsigned long) time(NULL);

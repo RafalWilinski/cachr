@@ -4,6 +4,9 @@ project(cachr)
 set (VERSION_MAJOR 0)
 set (VERSION_MINOR 1)
 
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
 
 set(SOURCE_FILES
@@ -15,3 +18,4 @@ set(SOURCE_FILES
         src/libs/picohttpparser.c src/libs/picohttpparser.h src/netutils.c src/configutils.c src/configutils.h src/netutils.h src/utils.c src/utils.h)
 
 add_executable(cachr ${SOURCE_FILES})
+target_link_libraries(cachr Threads::Threads)
