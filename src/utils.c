@@ -4,17 +4,13 @@
 #include <pthread.h>
 #include "utils.h"
 
-#if __APPLE__
-#include <ntsid.h>
-#endif
-
 long get_timestamp() {
   return (unsigned long) time(NULL);
 }
 
-u_int64_t hash_buffer(char* str) {
-  u_int64_t c, hash = 2317;
-  while ((c = (u_int64_t) *str++)) {
+uint64_t hash_buffer(char* str) {
+  uint64_t c, hash = 2317;
+  while ((c = (uint64_t) *str++)) {
     hash = ((hash << 5) + hash) + c;
   }
 
