@@ -1,3 +1,5 @@
+#include <sys/types.h>
+#include <sys/socket.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <string.h>
