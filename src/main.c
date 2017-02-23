@@ -158,7 +158,7 @@ void* handle_tcp_connection(void *ctx) {
   int tid = (int) gettid(), read_timeout = -1, write_timeout = -1, status = -1, request_content_length = -1,
       response_content_length = -1, ttl = cfg.ttl, i, req_parsed = 0, res_parsed = 0, res_minor_version, res_status,
       minor_version, pret = -2;
-  int sck = (int) ctx;
+  int sck = (int) ctx, chunked = 0;
   uint64_t key;
   size_t method_len, path_len, num_headers;
   char *buffer = malloc(BUFSIZE), *req_method, *req_path;
@@ -179,6 +179,7 @@ void* handle_tcp_connection(void *ctx) {
   while (poll(fds, (nfds_t) 1, read_timeout) && (status != 0)) {
     if (fds[0].revents & POLLHUP) {
       printf("[%d] Fd: %d was disconnected.\n", tid, sck);
+      pthread_exit(NULL);
     } else if (fds[0].revents & POLLNVAL) {
       printf("[%d] Fd: %d is invalid.\n", tid, sck);
     } else if (fds[0].revents & POLLERR) {
@@ -306,6 +307,7 @@ void* handle_tcp_connection(void *ctx) {
         while (poll(req_fds, (nfds_t) 1, write_timeout)) {
           if (fds[0].revents & POLLHUP) {
             printf("[%d] Fd: %d was disconnected.\n", tid, req_fds[0].fd);
+            sleep(1);
           } else if (req_fds[0].revents & POLLNVAL) {
             printf("[%d] Fd: %d is invalid.\n", tid, req_fds[0].fd);
           } else if (req_fds[0].revents & POLLERR) {
@@ -393,6 +395,11 @@ void* handle_tcp_connection(void *ctx) {
                     }
                   } else if (strcmp("Content-Length", name) == 0) {
                     response_content_length = atoi(value);
+                  } else if (strcmp("Transfer-Encoding", name) == 0) {
+                    if (strcmp("chunked", value) == 0) {
+                      printf("Detected chunked response...\n");
+                      chunked = 1;
+                    }
                   }
 
                   free(name);
@@ -402,7 +409,10 @@ void* handle_tcp_connection(void *ctx) {
                 res_parsed = 1;
               }
 
-              if (buffer[strlen(buffer) - 1] == '\n' && buffer[strlen(buffer) - 2] == '\n') {
+              printf("Last two: %d, %d\n", buffer[size - 1], buffer[size - 2]);
+
+              if (chunked == 1 && buffer[strlen(buffer) - 1] == 10 && buffer[strlen(buffer) - 2] == 13) {
+                printf("[%d] End of chunked response\n", tid);
                 break;
               }
 
@@ -481,6 +491,11 @@ void* handle_tcp_connection(void *ctx) {
               break;
             }
           }
+        } else {
+          printf("[%d] Whole response sent!\n", tid);
+          free(buffer);
+          free(fds);
+          pthread_exit(NULL);
         }
       } else {
         printf("[%d] Incorrect status! %d\n", tid, status);
