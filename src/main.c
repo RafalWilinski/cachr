@@ -192,9 +192,8 @@ void* handle_tcp_connection(void *ctx) {
       ssize_t rsize = 0, capacity = BUFSIZE;
 
       while ((rsize = read(fds[0].fd, buffer + size, capacity - size))) {
-        /* Reading should be continued later */
         if (rsize == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-          printf("[%d] would block\n", tid);
+          printf("[%d] Would block\n", tid);
           break;
         }
 
@@ -346,7 +345,7 @@ void* handle_tcp_connection(void *ctx) {
             char *msg;
             size_t msg_len;
 
-            printf("[%d] POLLIN INNER rsize: %d, size: %d,capacity: %d, buffer: %s\n", tid, (int) rsize, (int) size,
+            printf("[%d] POLLIN INNER rsize: %d, size: %d, capacity: %d, buffer: %s\n", tid, (int) rsize, (int) size,
                    (int) capacity, buffer);
             req_fds[0].revents = 0;
 
@@ -409,13 +408,6 @@ void* handle_tcp_connection(void *ctx) {
                 res_parsed = 1;
               }
 
-              printf("Last two: %d, %d\n", buffer[size - 1], buffer[size - 2]);
-
-              if (chunked == 1 && buffer[strlen(buffer) - 1] == 10 && buffer[strlen(buffer) - 2] == 13) {
-                printf("[%d] End of chunked response\n", tid);
-                break;
-              }
-
               if (size == capacity) {
                 printf("[%d] Reallocating buffer to capacity: %d\n", tid, (int) (capacity * 2));
                 capacity *= 2;
@@ -438,6 +430,11 @@ void* handle_tcp_connection(void *ctx) {
                   break;
                 }
               }
+
+              if (chunked == 1 && buffer[strlen(buffer) - 1] == 10 && buffer[strlen(buffer) - 2] == 13) {
+                printf("[%d] End of chunked response\n", tid);
+                break;
+              } else continue;
             }
 
 
@@ -459,7 +456,7 @@ void* handle_tcp_connection(void *ctx) {
             close(req_fds[0].fd);
             status = 3;
             fds[0].events = POLLOUT;
-            printf("Closing sock=%d, status: %d\n", req_fds[0].fd, status);
+            printf("[%d] Closing sock=%d, status: %d\n", tid, req_fds[0].fd, status);
             break;
           }
         }
@@ -493,6 +490,8 @@ void* handle_tcp_connection(void *ctx) {
           }
         } else {
           printf("[%d] Whole response sent!\n", tid);
+
+          close(fds[0].fd);
           free(buffer);
           free(fds);
           pthread_exit(NULL);
